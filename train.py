@@ -382,8 +382,10 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
             )
         except TypeError:
             samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps)
-        samples = samples.view(samples.size(0), -1).cpu().numpy()
-        samples = samples * data_std.view(-1).cpu().numpy() + data_mean.view(-1).cpu().numpy()
+        samples = samples.cpu()
+        # Keep native sequential state shape, e.g. [batch, seq_len, channel, height, width]
+        samples = samples * data_std.to(samples.device) + data_mean.to(samples.device)
+        samples = samples.numpy()
         
         sample_file = os.path.join(sample_dir, f"sample_batch{i+1}.npy")
         np.save(sample_file, samples)

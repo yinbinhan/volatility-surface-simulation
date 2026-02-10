@@ -373,7 +373,15 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     
     for i in range(sample_batches):
         # Pass save_timesteps parameter to sample method for early stopping evaluation
-        samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps)
+        try:
+            samples = diffusion.sample(
+                batch_size=samples_per_batch,
+                save_timesteps=save_timesteps,
+                show_progress=True,
+                progress_desc=f"Sampling batch {i+1}/{sample_batches}",
+            )
+        except TypeError:
+            samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps)
         samples = samples.view(samples.size(0), -1).cpu().numpy()
         samples = samples * data_std.view(-1).cpu().numpy() + data_mean.view(-1).cpu().numpy()
         

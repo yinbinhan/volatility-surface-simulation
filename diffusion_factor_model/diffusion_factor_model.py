@@ -1740,6 +1740,7 @@ class Trainer:
             update_pbar_batches = total_batches  # // 2
             grad_norm_total = 0.0
             grad_norm_count = 0
+            latest_grad_norm = 0.0
             # Update scheduler for each epoch
             self.scheduler.step(epoch)
             
@@ -1764,6 +1765,7 @@ class Trainer:
                         if math.isfinite(grad_norm_value):
                             grad_norm_total += grad_norm_value
                             grad_norm_count += 1
+                            latest_grad_norm = grad_norm_value
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
@@ -1775,7 +1777,7 @@ class Trainer:
 
                     # Update progress bar and display loss only when update_pbar_batches is reached
                     if (batch_idx + 1) % update_pbar_batches == 0:
-                        pbar.set_postfix(loss=total_loss / num_batches)
+                        pbar.set_postfix(loss=total_loss / num_batches, grad_norm=latest_grad_norm)
                         pbar.update(update_pbar_batches)
 
                 # Log metrics at the end of the epoch
@@ -1783,6 +1785,7 @@ class Trainer:
                 avg_grad_norm = grad_norm_total / grad_norm_count if grad_norm_count else 0.0
 
                 self.logger.add_scalar('Train/Average Loss', avg_train_loss, epoch)
+                self.logger.add_scalar('Train/Average Grad Norm', avg_grad_norm, epoch)
                 self.logger.flush()
 
                 self.accelerator.print(
@@ -1838,11 +1841,27 @@ class Trainer:
                 self.ema.ema_model.eval()
                 with torch.no_grad():
                     # Pass save_timesteps parameter for early stopping evaluation
-                    samples = self.ema.ema_model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
+                    try:
+                        samples = self.ema.ema_model.sample(
+                            self.num_new_samples,
+                            save_timesteps=self.save_timesteps,
+                            show_progress=True,
+                            progress_desc=f"Sampling (EMA, epoch {epoch+1})",
+                        )
+                    except TypeError:
+                        samples = self.ema.ema_model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
             else:
                 with torch.no_grad():
                     # Pass save_timesteps parameter for early stopping evaluation
-                    samples = self.model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
+                    try:
+                        samples = self.model.sample(
+                            self.num_new_samples,
+                            save_timesteps=self.save_timesteps,
+                            show_progress=True,
+                            progress_desc=f"Sampling (epoch {epoch+1})",
+                        )
+                    except TypeError:
+                        samples = self.model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
             
             samples_path = self.checkpoint_folder / f"fid_samples-epoch-{epoch+1}.pt"
             

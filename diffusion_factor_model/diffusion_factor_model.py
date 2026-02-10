@@ -1756,8 +1756,14 @@ class Trainer:
                     num_batches += 1
 
                     # Update model parameters after accumulating `gradient_accumulate_every` batches
-                    if (batch_idx + 1) % self.gradient_accumulate_every == 0:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    should_step = (batch_idx + 1) % self.gradient_accumulate_every == 0
+                    is_last_batch = (batch_idx + 1) == total_batches
+                    if should_step or is_last_batch:
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+                        if math.isfinite(grad_norm_value):
+                            grad_norm_total += grad_norm_value
+                            grad_norm_count += 1
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 

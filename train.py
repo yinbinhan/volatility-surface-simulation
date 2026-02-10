@@ -9,6 +9,8 @@ import os
 import gc
 import argparse
 import time
+import json
+import subprocess
 from tqdm import tqdm
 
 
@@ -18,7 +20,6 @@ from diffusion_factor_model.diffusion_factor_model import (
     Trainer,
 )
 import config.config as config
-from DiT import DiT
 
 def get_dim_mults_for_size(height, width):
     """
@@ -46,7 +47,7 @@ def get_dim_mults_for_size(height, width):
     else:
         return config.DIM_MULTS_MINIMAL # Minimal case
 
-def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, save_timesteps=None):
+def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, save_timesteps=None, num_features=None, window_start=0, window_length=None, conditioning_path=None, conditioning_length=None, checkpoint_path=None, skip_training=False, cli_args=None):
     """
     Train the diffusion model using a specific data file
     
@@ -162,38 +163,31 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
         print(f"Using {num_features} features from the data")
         data_shape = data_np.shape
     
-    # Determine data dimensions and reshape strategy
+    # Determine data dimensions and reshape strategy for sequential diffusion
+    # Expected canonical layout is [samples, seq_len, channel, height, width], but we keep
+    # backward compatibility with scalar/vector-per-step layouts.
     if len(data_shape) == 2:
-        # data (samples, features) - reshape to 2D format
-        samples, features = data_shape
-        
-        # Try to make the image as square as possible
-        width = 2**(int(np.log2(features)) // 2)
-        height = features // width
-        
-        if height * width != features:
-            # If not perfectly divisible, use a simple reshape
-            height, width = 1, features
-        
-        # Reshape data to [samples, 1, height, width]
+        # [samples, seq_len] -> scalar state per step
         data = torch.from_numpy(data_np).float()
-        if data.shape[1] != features:
-            print(f"Warning: Data dimension ({data.shape[1]}) doesn't match expected features ({features})")
-        
-        data = data.reshape(-1, 1, height, width)
-        print(f"Reshaped 2D data to: {data.shape} with dimensions [batch, channels, height={height}, width={width}]")
-        
     elif len(data_shape) == 3:
-        # data (samples, height, width) - add channel dimension
-        samples, height, width = data_shape
-        
-        # Convert to tensor and add channel dimension
+        # [samples, seq_len, features] -> vector state per step
         data = torch.from_numpy(data_np).float()
-        data = data.unsqueeze(1)  # Add channel dimension [samples, 1, height, width]
-        print(f"Reshaped 3D data to: {data.shape} with dimensions [batch, channels, height={height}, width={width}]")
-        
+    elif len(data_shape) == 4:
+        # [samples, seq_len, height, width] -> add channel dim
+        data = torch.from_numpy(data_np).float().unsqueeze(2)
+    elif len(data_shape) == 5:
+        # [samples, seq_len, channel, height, width]
+        data = torch.from_numpy(data_np).float()
     else:
-        window_end = min(total_seq_len, window_start + max(1, int(window_length)))
+        raise ValueError(
+            f"Unsupported data shape {data_shape}. Expected [N,S], [N,S,F], [N,S,H,W], or [N,S,C,H,W]."
+        )
+
+    total_seq_len = data.shape[1]
+    if window_length is None:
+        window_end = total_seq_len
+    else:
+        window_end = min(total_seq_len, int(window_start) + max(1, int(window_length)))
 
     if window_start >= total_seq_len:
         raise ValueError(
@@ -208,8 +202,9 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
         )
 
     data = data[:, window_start:window_end]
-    samples, seq_len = data.shape
-    print(f"Using sequence data with length {seq_len} and {samples} samples")
+    samples, seq_len = data.shape[:2]
+    state_shape = tuple(data.shape[2:])
+    print(f"Using sequence data with length {seq_len}, state shape {state_shape}, and {samples} samples")
 
     # Create directories for this experiment
     model_dir = os.path.join(config.MODELS_DIR, exp_id)
@@ -268,16 +263,16 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     conditioning_source = None
     if conditioning_path is not None:
         conditioning_np = np.load(conditioning_path)
-        if conditioning_np.ndim == 1:
-            conditioning_np = conditioning_np.reshape(1, -1)
-        elif conditioning_np.ndim > 2:
-            conditioning_np = conditioning_np.reshape(conditioning_np.shape[0], -1)
-        conditioning = torch.from_numpy(conditioning_np).float()
-        if conditioning.shape[1] != total_seq_len:
+        if conditioning_np.shape[1] != total_seq_len:
             raise ValueError(
-                f"Conditioning sequence length {conditioning.shape[1]} "
+                f"Conditioning sequence length {conditioning_np.shape[1]} "
                 f"does not match data length {total_seq_len}"
             )
+        if tuple(conditioning_np.shape[2:]) != state_shape:
+            raise ValueError(
+                f"Conditioning state shape {tuple(conditioning_np.shape[2:])} does not match data state shape {state_shape}"
+            )
+        conditioning = torch.from_numpy(conditioning_np).float()
         conditioning = conditioning[:, window_start:window_end]
         conditioning_source = (conditioning - data_mean) / data_std
 
@@ -291,18 +286,24 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     if epochs is None:
         epochs = config.EPOCHS
     
-    # Initialize model with appropriate dimension multipliers
-    model = Unet(
-        dim=config.MODEL_DIM,
-        channels=config.MODEL_CHANNELS,
-        filter_size=config.MODEL_FILTER_SIZE,
-        dim_mults=dim_mults  # Use appropriate multipliers for this input size
+    # Initialize sequential transformer model
+    model = ConditionalTransformer(
+        seq_len=seq_len,
+        dim=config.TRANSFORMER_DIM,
+        depth=config.TRANSFORMER_LAYERS,
+        heads=config.TRANSFORMER_HEADS,
+        ff_mult=config.TRANSFORMER_FF_MULT,
+        dropout=config.TRANSFORMER_DROPOUT,
+        use_bos_token=config.USE_BOS_TOKEN,
+        use_alibi=config.USE_ALIBI,
+        alibi_slope=config.ALIBI_SLOPE,
+        first_token_bias=config.FIRST_TOKEN_BIAS,
+        state_shape=state_shape,
     )
-    
+
     print("Model initialized")
-    
-    # Initialize diffusion process with proper image size
-    diffusion = GaussianDiffusion(
+
+    diffusion = SequentialGaussianDiffusion(
         model,
         seq_len=seq_len,
         timesteps=config.TIMESTEPS,
@@ -310,7 +311,8 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
         ddim_eta=config.DDIM_ETA,
         objective=config.OBJECTIVE,
         beta_schedule=config.BETA_SCHEDULE,
-        auto_normalize=config.AUTO_NORMALIZE
+        auto_normalize=config.AUTO_NORMALIZE,
+        state_shape=state_shape,
     )
     
     print("Diffusion process initialized")
@@ -408,7 +410,19 @@ if __name__ == "__main__":
                       help="Number of epochs to train (None = use config value)")
     parser.add_argument("--save_timesteps", type=int, nargs='+', default=None,
                       help="Specific timesteps to save during sampling for early stopping evaluation (e.g., --save_timesteps 100 200 500)")
+    parser.add_argument("--window_start", type=int, default=0,
+                      help="Sequence window start index")
+    parser.add_argument("--window_length", type=int, default=None,
+                      help="Sequence window length")
+    parser.add_argument("--conditioning_path", type=str, default=None,
+                      help="Optional conditioning tensor path with shape [N,S,*state_shape]")
+    parser.add_argument("--conditioning_length", type=int, default=None,
+                      help="Number of sequence steps to condition during sampling")
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                      help="Checkpoint to load before training/sampling")
+    parser.add_argument("--skip_training", action="store_true",
+                      help="Skip training and only run sampling (requires --checkpoint_path)")
     
     args = parser.parse_args()
     
-    train_model(args.data_path, args.seed, args.num_samples, args.gpu, args.epochs, args.save_timesteps) 
+    train_model(args.data_path, args.seed, args.num_samples, args.gpu, args.epochs, args.save_timesteps, num_features=args.num_features, window_start=args.window_start, window_length=args.window_length, conditioning_path=args.conditioning_path, conditioning_length=args.conditioning_length, checkpoint_path=args.checkpoint_path, skip_training=args.skip_training, cli_args=vars(args)) 

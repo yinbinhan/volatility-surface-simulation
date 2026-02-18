@@ -36,8 +36,12 @@ class LoRALinear(nn.Module):
         if self.base.bias is not None:
             self.base.bias.requires_grad_(False)
 
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank))
+        self.lora_A = nn.Parameter(
+            torch.zeros(rank, base.in_features, device=base.weight.device, dtype=base.weight.dtype)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(base.out_features, rank, device=base.weight.device, dtype=base.weight.dtype)
+        )
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
@@ -59,11 +63,12 @@ def inject_lora(
     alpha: float = 16.0,
     dropout: float = 0.0,
     target_modules: Sequence[str] = ("encoder", "output", "value_proj", "time_mlp"),
+    prefix: str = "",
 ) -> nn.Module:
     """Replace selected nn.Linear layers with LoRA-augmented layers."""
 
     for child_name, child in list(module.named_children()):
-        fq_name = child_name
+        fq_name = f"{prefix}.{child_name}" if prefix else child_name
         if isinstance(child, nn.Linear) and _matches_any(fq_name, target_modules):
             setattr(module, child_name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
             continue
@@ -73,6 +78,7 @@ def inject_lora(
             alpha=alpha,
             dropout=dropout,
             target_modules=target_modules,
+            prefix=fq_name,
         )
     return module
 

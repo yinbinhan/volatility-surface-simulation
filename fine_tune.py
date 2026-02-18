@@ -72,7 +72,10 @@ def main():
     seq_len, state_shape = infer_shape(args.data_path)
     diffusion = build_model(seq_len, state_shape).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    try:
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    except TypeError:
+        ckpt = torch.load(args.checkpoint, map_location=device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     diffusion.load_state_dict(state, strict=False)
 

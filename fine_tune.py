@@ -1,0 +1,114 @@
+"""CLI entrypoint for online LoRA fine-tuning with arbitrage reward."""
+
+import argparse
+import numpy as np
+import torch
+
+import config.config as config
+from diffusion_factor_model import (
+    ArbitrageValidator,
+    ConditionalTransformer,
+    OnlineDDPMLoRAFineTuner,
+    SequentialGaussianDiffusion,
+    make_arbitrage_reward_fn,
+)
+
+
+def build_model(seq_len, state_shape):
+    model = ConditionalTransformer(
+        seq_len=seq_len,
+        dim=config.TRANSFORMER_DIM,
+        depth=config.TRANSFORMER_LAYERS,
+        heads=config.TRANSFORMER_HEADS,
+        ff_mult=config.TRANSFORMER_FF_MULT,
+        dropout=config.TRANSFORMER_DROPOUT,
+        use_bos_token=config.USE_BOS_TOKEN,
+        use_alibi=config.USE_ALIBI,
+        alibi_slope=config.ALIBI_SLOPE,
+        first_token_bias=config.FIRST_TOKEN_BIAS,
+        state_shape=state_shape,
+    )
+    diffusion = SequentialGaussianDiffusion(
+        model,
+        seq_len=seq_len,
+        timesteps=config.TIMESTEPS,
+        sampling_timesteps=config.SAMPLING_TIMESTEPS,
+        ddim_eta=config.DDIM_ETA,
+        objective=config.OBJECTIVE,
+        beta_schedule=config.BETA_SCHEDULE,
+        auto_normalize=config.AUTO_NORMALIZE,
+        state_shape=state_shape,
+    )
+    return diffusion
+
+
+def infer_shape(data_path):
+    data = np.load(data_path)
+    if data.ndim == 5:
+        return int(data.shape[1]), tuple(data.shape[2:])
+    if data.ndim == 4:
+        return int(data.shape[1]), (1, int(data.shape[2]), int(data.shape[3]))
+    if data.ndim == 3:
+        return int(data.shape[1]), (int(data.shape[2]),)
+    if data.ndim == 2:
+        return int(data.shape[1]), ()
+    raise ValueError(f"Unsupported data shape: {data.shape}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--kl_weight", type=float, default=1e-3)
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--grid_size", type=int, default=5)
+    parser.add_argument("--save_path", type=str, default="ft_lora.pt")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seq_len, state_shape = infer_shape(args.data_path)
+    diffusion = build_model(seq_len, state_shape).to(device)
+
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    diffusion.load_state_dict(state, strict=False)
+
+    m_vals = np.linspace(0.8, 1.2, args.grid_size)
+    t_vals = np.linspace(0.1, 2.0, args.grid_size)
+    validator = ArbitrageValidator(m_vals, t_vals)
+    reward_fn = make_arbitrage_reward_fn(validator)
+
+    tuner = OnlineDDPMLoRAFineTuner(
+        diffusion,
+        reward_fn=reward_fn,
+        lr=args.lr,
+        kl_weight=args.kl_weight,
+        lora_rank=args.lora_rank,
+        device=device,
+    )
+
+    for step in range(args.steps):
+        stats = tuner.step(args.batch_size)
+        if (step + 1) % 10 == 0:
+            print(
+                f"step={step+1} loss={stats.loss:.4f} policy={stats.policy_loss:.4f} "
+                f"kl={stats.kl_loss:.4f} reward_mean={stats.reward_mean:.4f}"
+            )
+
+    torch.save(
+        {
+            "model": diffusion.state_dict(),
+            "steps": args.steps,
+            "state_shape": state_shape,
+            "seq_len": seq_len,
+        },
+        args.save_path,
+    )
+    print(f"Saved fine-tuned checkpoint to {args.save_path}")
+
+
+if __name__ == "__main__":
+    main()

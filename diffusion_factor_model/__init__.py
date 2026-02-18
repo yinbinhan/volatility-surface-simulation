@@ -12,3 +12,10 @@ from diffusion_factor_model.diffusion_factor_model import (
 )
 
 __version__ = "0.1.0"
+
+
+from diffusion_factor_model.fine_tuning import (
+    LoRALinear,
+    OnlineDDPMLoRAFineTuner,
+    FineTuneStats,
+)

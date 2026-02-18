@@ -57,13 +57,8 @@ AUTO_NORMALIZE = False
 
 # Training parameters
 BATCH_SIZE = 256
-<<<<<<< HEAD
 LEARNING_RATE = 7e-5
 EPOCHS = 3000
-=======
-LEARNING_RATE = 1e-4
-EPOCHS = 1000
->>>>>>> origin/main
 WEIGHT_DECAY = 0.01
 USE_COSINE_SCHEDULER = True
 USE_WARM_UP = True

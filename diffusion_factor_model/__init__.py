@@ -18,4 +18,6 @@ from diffusion_factor_model.fine_tuning import (
     LoRALinear,
     OnlineDDPMLoRAFineTuner,
     FineTuneStats,
+    ArbitrageValidator,
+    make_arbitrage_reward_fn,
 )

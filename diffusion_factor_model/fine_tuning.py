@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -114,6 +115,65 @@ class FineTuneStats:
     kl_loss: float
     reward_mean: float
     reward_std: float
+
+
+
+
+class ArbitrageValidator:
+    """Arbitrage-violation calculator for generated volatility/price surfaces."""
+
+    def __init__(self, grid_m, grid_t):
+        self.m = torch.tensor(grid_m, dtype=torch.float32)
+        self.t = torch.tensor(grid_t, dtype=torch.float32)
+        self.dt = self.t[1:] - self.t[:-1]
+        self.dm = self.m[1:] - self.m[:-1]
+
+    def per_sample_total_violation(self, tensor_5d: torch.Tensor) -> torch.Tensor:
+        if isinstance(tensor_5d, np.ndarray):
+            prices = torch.tensor(tensor_5d, dtype=torch.float32)
+        else:
+            prices = tensor_5d
+
+        device = prices.device
+        t = self.t.to(device)
+        dt = self.dt.to(device)
+        dm = self.dm.to(device)
+
+        # expects input [B, S, C, H, W], channel-1 = normalized call price C/S
+        batch_size, seq_len = prices.shape[:2]
+        prices = prices[..., 1, :, :].reshape(batch_size * seq_len, len(t), len(self.m))
+
+        diff_t = prices[:, :-1, :] - prices[:, 1:, :]
+        l1_map = torch.relu(t[:-1].view(1, -1, 1) * diff_t / dt.view(1, -1, 1))
+        l1 = torch.sum(l1_map, dim=(1, 2))
+
+        diff_m = prices[:, :, 1:] - prices[:, :, :-1]
+        slope = diff_m / dm.view(1, 1, -1)
+        l2_map = torch.relu(slope)
+        l2 = torch.sum(l2_map, dim=(1, 2))
+
+        l3_map = torch.relu(slope[:, :, :-1] - slope[:, :, 1:])
+        l3 = torch.sum(l3_map, dim=(1, 2))
+
+        total = l1 + l2 + l3
+        return total.view(batch_size, seq_len).mean(dim=1)
+
+    def calculate_violations(self, tensor_5d: torch.Tensor):
+        penalties = self.per_sample_total_violation(tensor_5d)
+        return {
+            "total": float(penalties.mean().item()),
+            "per_sample": penalties.detach().cpu().numpy(),
+        }
+
+
+def make_arbitrage_reward_fn(validator: ArbitrageValidator):
+    """Return reward function for RL fine-tuning: maximize negative total violation."""
+
+    def reward_fn(samples: torch.Tensor) -> torch.Tensor:
+        penalties = validator.per_sample_total_violation(samples)
+        return -penalties
+
+    return reward_fn
 
 
 class OnlineDDPMLoRAFineTuner:

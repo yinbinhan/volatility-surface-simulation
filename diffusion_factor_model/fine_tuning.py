@@ -214,8 +214,8 @@ class OnlineDDPMLoRAFineTuner:
     """Online policy-gradient fine-tuning for sequential DDPM with LoRA.
 
     - Generates fresh rollouts each step (no replay buffer).
-    - Uses sequence-level rewards supplied by an external callback.
-    - Regularizes policy against a frozen reference with closed-form Gaussian KL.
+    - Uses sequence-level rewards supplied by an external callback with direct differentiable optimization.
+    - Regularizes policy against a frozen reference with score-space KL surrogate.
     """
 
     def __init__(
@@ -269,10 +269,10 @@ class OnlineDDPMLoRAFineTuner:
         mean, _, log_var = model.q_posterior(x_start, x_t, times)
         return mean, log_var, pred_noise, x_start
 
-    @torch.no_grad()
     def rollout(self, batch_size: int, show_progress: bool = False):
         model = self.diffusion
-        seq = torch.zeros((batch_size, model.seq_len, *model.state_shape), device=self.device)
+        seq_context = torch.zeros((batch_size, model.seq_len, *model.state_shape), device=self.device)
+        generated_states: List[torch.Tensor] = []
         transitions: List[Dict[str, torch.Tensor]] = []
 
         positions = range(model.seq_len)
@@ -285,7 +285,7 @@ class OnlineDDPMLoRAFineTuner:
 
             for t in reversed(range(model.num_timesteps)):
                 times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
-                context, key_padding_mask = model.build_context(seq, target_indices, x_t)
+                context, key_padding_mask = model.build_context(seq_context, target_indices, x_t)
 
                 mean, log_var, _, x_start = self._compute_transition_params(
                     model, context, key_padding_mask, target_indices, x_t, times
@@ -303,21 +303,21 @@ class OnlineDDPMLoRAFineTuner:
                         "target_indices": target_indices.detach(),
                         "times": times.detach(),
                         "x_t": x_t.detach(),
-                        "x_prev": x_prev.detach(),
                     }
                 )
                 x_t = x_prev
 
-            seq[:, pos] = x_t
+            generated_states.append(x_t)
+            seq_context[:, pos] = x_t.detach()
 
+        seq = torch.stack(generated_states, dim=1)
         return seq, transitions
 
-    def _compute_logprob_and_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]):
-        total_log_prob = None
+    def _compute_kl_only(self, transitions: Iterable[Dict[str, torch.Tensor]]):
         total_kl = None
 
         for tr in transitions:
-            mean_new, log_var_new, pred_noise_new, _ = self._compute_transition_params(
+            _, _, pred_noise_new, _ = self._compute_transition_params(
                 self.diffusion,
                 tr["context"],
                 tr["key_padding_mask"],
@@ -325,7 +325,6 @@ class OnlineDDPMLoRAFineTuner:
                 tr["x_t"],
                 tr["times"],
             )
-            log_prob = gaussian_log_prob(tr["x_prev"], mean_new, log_var_new)
 
             with torch.no_grad():
                 _, _, pred_noise_ref, _ = self._compute_transition_params(
@@ -336,18 +335,19 @@ class OnlineDDPMLoRAFineTuner:
                     tr["x_t"],
                     tr["times"],
                 )
-            # Variance-independent KL surrogate for fixed-variance DDPM:
-            # ||eps_theta - eps_ref||_2^2 on the same (x_t, t, context).
+
             kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
 
-            if total_log_prob is None:
-                total_log_prob = log_prob
+            if total_kl is None:
                 total_kl = kl
             else:
-                total_log_prob = total_log_prob + log_prob
                 total_kl = total_kl + kl
+            num_transitions += 1
 
-        return total_log_prob, total_kl
+        if self.normalize_objective_by_transitions and num_transitions > 0:
+            total_kl = total_kl / num_transitions
+
+        return total_kl
 
     def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None) -> FineTuneStats:
         reward_fn = reward_fn or self.reward_fn
@@ -369,11 +369,11 @@ class OnlineDDPMLoRAFineTuner:
         if self.normalize_rewards:
             rewards = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
 
-        log_prob_sum, kl_sum = self._compute_logprob_and_kl(transitions)
+        kl_sum = self._compute_kl_only(transitions)
 
-        policy_loss = -(rewards.detach() * log_prob_sum).mean()
+        reward_loss = -rewards.mean()
         kl_loss = kl_sum.mean()
-        loss = policy_loss + self.kl_weight * kl_loss
+        loss = reward_loss + self.kl_weight * kl_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -387,7 +387,7 @@ class OnlineDDPMLoRAFineTuner:
         with torch.no_grad():
             return FineTuneStats(
                 loss=float(loss.item()),
-                policy_loss=float(policy_loss.item()),
+                policy_loss=float(reward_loss.item()),
                 kl_loss=float(kl_loss.item()),
                 reward_mean=float(rewards.mean().item()),
                 reward_std=float(rewards.std(unbiased=False).item()),

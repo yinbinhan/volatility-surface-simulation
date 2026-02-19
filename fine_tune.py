@@ -106,6 +106,7 @@ def main():
     parser.add_argument("--kl_logvar_min", type=float, default=-20.0)
     parser.add_argument("--kl_logvar_max", type=float, default=20.0)
     parser.add_argument("--results_root", type=str, default=None)
+    parser.add_argument("--gradient_mode", type=str, default="hybrid", choices=["direct", "reinforce", "hybrid"])
     args = parser.parse_args()
 
     timestamp = int(time.time())
@@ -152,6 +153,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         kl_logvar_min=args.kl_logvar_min,
         kl_logvar_max=args.kl_logvar_max,
+        gradient_mode=args.gradient_mode,
         device=device,
     )
 

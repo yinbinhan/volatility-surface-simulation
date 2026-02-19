@@ -235,6 +235,7 @@ class OnlineDDPMLoRAFineTuner:
         kl_logvar_min: float = -20.0,
         kl_logvar_max: float = 20.0,
         normalize_objective_by_transitions: bool = True,
+        gradient_mode: str = "direct",
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
@@ -246,6 +247,9 @@ class OnlineDDPMLoRAFineTuner:
         self.kl_logvar_min = float(kl_logvar_min)
         self.kl_logvar_max = float(kl_logvar_max)
         self.normalize_objective_by_transitions = normalize_objective_by_transitions
+        self.gradient_mode = gradient_mode
+        if self.gradient_mode not in {"direct", "reinforce", "hybrid"}:
+            raise ValueError("gradient_mode must be one of: direct, reinforce, hybrid")
 
         inject_lora(
             self.diffusion.model,
@@ -311,6 +315,7 @@ class OnlineDDPMLoRAFineTuner:
                         "target_indices": target_indices.detach(),
                         "times": times.detach(),
                         "x_t": x_t.detach(),
+                        "x_prev": x_prev.detach(),
                     }
                 )
                 x_t = x_prev
@@ -321,12 +326,13 @@ class OnlineDDPMLoRAFineTuner:
         seq = torch.stack(generated_states, dim=1)
         return seq, transitions
 
-    def _compute_kl_only(self, transitions: Iterable[Dict[str, torch.Tensor]]):
+    def _compute_logprob_and_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]):
+        total_log_prob = None
         total_kl = None
         num_transitions = 0
 
         for tr in transitions:
-            _, _, pred_noise_new, _ = self._compute_transition_params(
+            mean_new, log_var_new, pred_noise_new, _ = self._compute_transition_params(
                 self.diffusion,
                 tr["context"],
                 tr["key_padding_mask"],
@@ -334,6 +340,7 @@ class OnlineDDPMLoRAFineTuner:
                 tr["x_t"],
                 tr["times"],
             )
+            log_prob = gaussian_log_prob(tr["x_prev"], mean_new, log_var_new)
 
             with torch.no_grad():
                 _, _, pred_noise_ref, _ = self._compute_transition_params(
@@ -347,16 +354,19 @@ class OnlineDDPMLoRAFineTuner:
 
             kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
 
-            if total_kl is None:
+            if total_log_prob is None:
+                total_log_prob = log_prob
                 total_kl = kl
             else:
+                total_log_prob = total_log_prob + log_prob
                 total_kl = total_kl + kl
             num_transitions += 1
 
         if self.normalize_objective_by_transitions and num_transitions > 0:
+            total_log_prob = total_log_prob / num_transitions
             total_kl = total_kl / num_transitions
 
-        return total_kl
+        return total_log_prob, total_kl
 
     def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None) -> FineTuneStats:
         reward_fn = reward_fn or self.reward_fn
@@ -378,11 +388,17 @@ class OnlineDDPMLoRAFineTuner:
         if self.normalize_rewards:
             rewards = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
 
-        kl_sum = self._compute_kl_only(transitions)
+        log_prob_sum, kl_sum = self._compute_logprob_and_kl(transitions)
 
         reward_loss = -rewards.mean()
         kl_loss = kl_sum.mean()
-        loss = reward_loss + self.kl_weight * kl_loss
+        if self.gradient_mode == "direct":
+            grad_objective = reward_loss
+        else:
+            pg_loss = -(rewards.detach() * log_prob_sum).mean()
+            grad_objective = pg_loss
+        loss = grad_objective + self.kl_weight * kl_loss
+        report_loss = reward_loss + self.kl_weight * kl_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         skipped_step = 0.0
@@ -404,8 +420,8 @@ class OnlineDDPMLoRAFineTuner:
 
         with torch.no_grad():
             return FineTuneStats(
-                loss=float(loss.item()),
-                policy_loss=float(reward_loss.item()),
+                loss=float(report_loss.item()),
+                policy_loss=float(grad_objective.item()),
                 kl_loss=float(kl_loss.item()),
                 reward_mean=float(rewards.mean().item()),
                 reward_std=float(rewards.std(unbiased=False).item()),

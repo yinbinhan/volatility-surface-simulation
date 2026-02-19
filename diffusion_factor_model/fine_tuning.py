@@ -158,8 +158,23 @@ class ArbitrageValidator:
         dm = self.dm.to(device)
 
         # expects input [B, S, C, H, W], channel-1 = normalized call price C/S
-        batch_size, seq_len = prices.shape[:2]
-        prices = prices[..., 1, :, :].reshape(batch_size * seq_len, len(t), len(self.m))
+        if prices.ndim != 5:
+            raise ValueError(f"Expected [B,S,C,H,W], got shape {tuple(prices.shape)}")
+        batch_size, seq_len, channels, height, width = prices.shape
+        if channels < 2:
+            raise ValueError(
+                f"ArbitrageValidator expects at least 2 channels and uses channel index 1 for price, got C={channels}"
+            )
+
+        # If provided grids do not match generated surface resolution, adapt them to preserve endpoints.
+        if height != len(t):
+            t = torch.linspace(float(t[0].item()), float(t[-1].item()), steps=height, device=device, dtype=prices.dtype)
+            dt = t[1:] - t[:-1]
+        if width != len(self.m):
+            m = torch.linspace(float(self.m[0].item()), float(self.m[-1].item()), steps=width, device=device, dtype=prices.dtype)
+            dm = m[1:] - m[:-1]
+
+        prices = prices[:, :, 1, :, :].reshape(batch_size * seq_len, height, width)
 
         diff_t = prices[:, :-1, :] - prices[:, 1:, :]
         l1_map = torch.relu(t[:-1].view(1, -1, 1) * diff_t / dt.view(1, -1, 1))

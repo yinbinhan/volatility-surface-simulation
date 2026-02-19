@@ -45,6 +45,18 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
+
+    @property
+    def weight(self):
+        # Expose a Linear-compatible weight attribute for modules (e.g. MultiheadAttention)
+        # that access `.weight` directly on projection layers.
+        delta = torch.matmul(self.lora_B, self.lora_A) * self.scaling
+        return self.base.weight + delta
+
+    @property
+    def bias(self):
+        return self.base.bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
         lora_out = F.linear(self.dropout(x), self.lora_A)

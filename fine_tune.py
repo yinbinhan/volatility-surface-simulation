@@ -103,6 +103,8 @@ def main():
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--kl_logvar_min", type=float, default=-20.0)
+    parser.add_argument("--kl_logvar_max", type=float, default=20.0)
     parser.add_argument("--results_root", type=str, default=None)
     args = parser.parse_args()
 
@@ -148,6 +150,8 @@ def main():
         kl_weight=args.kl_weight,
         lora_rank=args.lora_rank,
         max_grad_norm=args.max_grad_norm,
+        kl_logvar_min=args.kl_logvar_min,
+        kl_logvar_max=args.kl_logvar_max,
         device=device,
     )
 
@@ -164,8 +168,14 @@ def main():
         writer.add_scalar("FT/grad_norm", stats.grad_norm, step)
         writer.add_scalar("FT/reward_mean", stats.reward_mean, step)
         writer.add_scalar("FT/reward_std", stats.reward_std, step)
+        writer.add_scalar("FT/skipped_step", stats.skipped_step, step)
 
-        pbar.set_postfix(loss=f"{stats.loss:.4f}", kl=f"{stats.kl_loss:.4f}", grad=f"{stats.grad_norm:.4f}")
+        pbar.set_postfix(
+            loss=f"{stats.loss:.4f}",
+            kl=f"{stats.kl_loss:.4f}",
+            grad=("inf" if not np.isfinite(stats.grad_norm) else f"{stats.grad_norm:.4f}"),
+            skip=int(stats.skipped_step),
+        )
 
         if step % args.save_every == 0:
             ckpt_path = run_dir / f"model-step-{step}.pt"

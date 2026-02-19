@@ -134,6 +134,7 @@ class FineTuneStats:
     reward_mean: float
     reward_std: float
     grad_norm: float
+    skipped_step: float
 
 
 
@@ -231,6 +232,9 @@ class OnlineDDPMLoRAFineTuner:
         lora_target_modules: Sequence[str] = ("encoder", "output", "value_proj", "time_mlp"),
         normalize_rewards: bool = True,
         max_grad_norm: float = 1.0,
+        kl_logvar_min: float = -20.0,
+        kl_logvar_max: float = 20.0,
+        normalize_objective_by_transitions: bool = True,
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
@@ -239,6 +243,9 @@ class OnlineDDPMLoRAFineTuner:
         self.kl_weight = kl_weight
         self.normalize_rewards = normalize_rewards
         self.max_grad_norm = float(max_grad_norm)
+        self.kl_logvar_min = float(kl_logvar_min)
+        self.kl_logvar_max = float(kl_logvar_max)
+        self.normalize_objective_by_transitions = normalize_objective_by_transitions
 
         inject_lora(
             self.diffusion.model,
@@ -267,6 +274,7 @@ class OnlineDDPMLoRAFineTuner:
             times,
         )
         mean, _, log_var = model.q_posterior(x_start, x_t, times)
+        log_var = torch.clamp(log_var, min=self.kl_logvar_min, max=self.kl_logvar_max)
         return mean, log_var, pred_noise, x_start
 
     @torch.no_grad()
@@ -315,6 +323,7 @@ class OnlineDDPMLoRAFineTuner:
     def _compute_logprob_and_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]):
         total_log_prob = None
         total_kl = None
+        num_transitions = 0
 
         for tr in transitions:
             mean_new, log_var_new, _, _ = self._compute_transition_params(
@@ -344,6 +353,11 @@ class OnlineDDPMLoRAFineTuner:
             else:
                 total_log_prob = total_log_prob + log_prob
                 total_kl = total_kl + kl
+            num_transitions += 1
+
+        if self.normalize_objective_by_transitions and num_transitions > 0:
+            total_log_prob = total_log_prob / num_transitions
+            total_kl = total_kl / num_transitions
 
         return total_log_prob, total_kl
 
@@ -372,13 +386,22 @@ class OnlineDDPMLoRAFineTuner:
         loss = policy_loss + self.kl_weight * kl_loss
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.diffusion.model.parameters() if p.requires_grad],
-            self.max_grad_norm,
-        )
-        grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
-        self.optimizer.step()
+        skipped_step = 0.0
+        if torch.isfinite(loss):
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in self.diffusion.model.parameters() if p.requires_grad],
+                self.max_grad_norm,
+            )
+            grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+            if math.isfinite(grad_norm_value):
+                self.optimizer.step()
+            else:
+                skipped_step = 1.0
+                grad_norm_value = float('inf')
+        else:
+            skipped_step = 1.0
+            grad_norm_value = float('inf')
 
         with torch.no_grad():
             return FineTuneStats(
@@ -388,4 +411,5 @@ class OnlineDDPMLoRAFineTuner:
                 reward_mean=float(rewards.mean().item()),
                 reward_std=float(rewards.std(unbiased=False).item()),
                 grad_norm=float(grad_norm_value),
+                skipped_step=float(skipped_step),
             )

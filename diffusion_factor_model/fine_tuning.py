@@ -133,6 +133,7 @@ class FineTuneStats:
     kl_loss: float
     reward_mean: float
     reward_std: float
+    grad_norm: float
 
 
 
@@ -229,6 +230,7 @@ class OnlineDDPMLoRAFineTuner:
         lora_dropout: float = 0.0,
         lora_target_modules: Sequence[str] = ("encoder", "output", "value_proj", "time_mlp"),
         normalize_rewards: bool = True,
+        max_grad_norm: float = 1.0,
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
@@ -236,6 +238,7 @@ class OnlineDDPMLoRAFineTuner:
         self.reward_fn = reward_fn
         self.kl_weight = kl_weight
         self.normalize_rewards = normalize_rewards
+        self.max_grad_norm = float(max_grad_norm)
 
         inject_lora(
             self.diffusion.model,
@@ -370,6 +373,11 @@ class OnlineDDPMLoRAFineTuner:
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            [p for p in self.diffusion.model.parameters() if p.requires_grad],
+            self.max_grad_norm,
+        )
+        grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
         self.optimizer.step()
 
         with torch.no_grad():
@@ -379,4 +387,5 @@ class OnlineDDPMLoRAFineTuner:
                 kl_loss=float(kl_loss.item()),
                 reward_mean=float(rewards.mean().item()),
                 reward_std=float(rewards.std(unbiased=False).item()),
+                grad_norm=float(grad_norm_value),
             )

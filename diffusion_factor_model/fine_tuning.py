@@ -264,6 +264,7 @@ class OnlineDDPMLoRAFineTuner:
         if len(trainable_params) == 0:
             raise ValueError("No trainable LoRA parameters found. Check lora_target_modules.")
         self.optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+        self.update_step = 0
 
     def _compute_transition_params(self, model, context, key_padding_mask, target_indices, x_t, times):
         pred_noise, x_start = model._model_predictions(
@@ -366,7 +367,9 @@ class OnlineDDPMLoRAFineTuner:
         if reward_fn is None:
             raise ValueError("reward_fn is required. Plug your sequence reward API via constructor or step(...).")
 
-        self.diffusion.train()
+        # Keep policy/reference in eval mode during rollout + KL computation to avoid dropout-induced KL noise.
+        self.diffusion.eval()
+        self.reference.eval()
         samples, transitions = self.rollout(batch_size=batch_size, show_progress=False)
 
         rewards = reward_fn(samples)
@@ -382,7 +385,13 @@ class OnlineDDPMLoRAFineTuner:
         log_prob_sum, kl_sum = self._compute_logprob_and_kl(transitions)
 
         policy_loss = -(rewards.detach() * log_prob_sum).mean()
-        kl_loss = kl_sum.mean()
+        raw_kl_loss = kl_sum.mean()
+        # At update step 0, policy and reference are identical (same pretrained weights),
+        # so regularization should not penalize the very first update.
+        if self.update_step == 0:
+            kl_loss = torch.zeros_like(raw_kl_loss)
+        else:
+            kl_loss = raw_kl_loss
         loss = policy_loss + self.kl_weight * kl_loss
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -402,6 +411,8 @@ class OnlineDDPMLoRAFineTuner:
         else:
             skipped_step = 1.0
             grad_norm_value = float('inf')
+
+        self.update_step += 1
 
         with torch.no_grad():
             return FineTuneStats(

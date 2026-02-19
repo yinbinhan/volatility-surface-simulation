@@ -264,7 +264,6 @@ class OnlineDDPMLoRAFineTuner:
         if len(trainable_params) == 0:
             raise ValueError("No trainable LoRA parameters found. Check lora_target_modules.")
         self.optimizer = torch.optim.AdamW(trainable_params, lr=lr)
-        self.update_step = 0
 
     def _compute_transition_params(self, model, context, key_padding_mask, target_indices, x_t, times):
         pred_noise, x_start = model._model_predictions(
@@ -327,7 +326,7 @@ class OnlineDDPMLoRAFineTuner:
         num_transitions = 0
 
         for tr in transitions:
-            mean_new, log_var_new, _, _ = self._compute_transition_params(
+            mean_new, log_var_new, pred_noise_new, _ = self._compute_transition_params(
                 self.diffusion,
                 tr["context"],
                 tr["key_padding_mask"],
@@ -338,7 +337,7 @@ class OnlineDDPMLoRAFineTuner:
             log_prob = gaussian_log_prob(tr["x_prev"], mean_new, log_var_new)
 
             with torch.no_grad():
-                mean_ref, log_var_ref, _, _ = self._compute_transition_params(
+                _, _, pred_noise_ref, _ = self._compute_transition_params(
                     self.reference,
                     tr["context"],
                     tr["key_padding_mask"],
@@ -346,7 +345,9 @@ class OnlineDDPMLoRAFineTuner:
                     tr["x_t"],
                     tr["times"],
                 )
-            kl = gaussian_kl_divergence(mean_new, log_var_new, mean_ref, log_var_ref)
+            # Variance-independent KL surrogate for fixed-variance DDPM:
+            # ||eps_theta - eps_ref||_2^2 on the same (x_t, t, context).
+            kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
 
             if total_log_prob is None:
                 total_log_prob = log_prob
@@ -385,13 +386,7 @@ class OnlineDDPMLoRAFineTuner:
         log_prob_sum, kl_sum = self._compute_logprob_and_kl(transitions)
 
         policy_loss = -(rewards.detach() * log_prob_sum).mean()
-        raw_kl_loss = kl_sum.mean()
-        # At update step 0, policy and reference are identical (same pretrained weights),
-        # so regularization should not penalize the very first update.
-        if self.update_step == 0:
-            kl_loss = torch.zeros_like(raw_kl_loss)
-        else:
-            kl_loss = raw_kl_loss
+        kl_loss = kl_sum.mean()
         loss = policy_loss + self.kl_weight * kl_loss
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -411,8 +406,6 @@ class OnlineDDPMLoRAFineTuner:
         else:
             skipped_step = 1.0
             grad_norm_value = float('inf')
-
-        self.update_step += 1
 
         with torch.no_grad():
             return FineTuneStats(

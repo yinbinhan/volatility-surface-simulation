@@ -100,30 +100,6 @@ def freeze_non_lora_params(module: nn.Module):
         param.requires_grad = ("lora_A" in name) or ("lora_B" in name)
 
 
-def gaussian_log_prob(x: torch.Tensor, mean: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-    """Elementwise Gaussian log-prob, summed over non-batch dims."""
-
-    log2pi = math.log(2 * math.pi)
-    out = -0.5 * (((x - mean) ** 2) * torch.exp(-log_var) + log_var + log2pi)
-    return out.flatten(start_dim=1).sum(dim=-1)
-
-
-def gaussian_kl_divergence(
-    mean_new: torch.Tensor,
-    log_var_new: torch.Tensor,
-    mean_ref: torch.Tensor,
-    log_var_ref: torch.Tensor,
-) -> torch.Tensor:
-    """KL(N_new || N_ref), summed over non-batch dims."""
-
-    var_new = torch.exp(log_var_new)
-    var_ref = torch.exp(log_var_ref)
-    kl = 0.5 * (
-        log_var_ref - log_var_new
-        + (var_new + (mean_new - mean_ref) ** 2) / var_ref
-        - 1.0
-    )
-    return kl.flatten(start_dim=1).sum(dim=-1)
 
 
 @dataclass
@@ -242,33 +218,19 @@ class OnlineDDPMLoRAFineTuner:
         *,
         reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         lr: float = 1e-4,
-        kl_weight: float = 1e-3,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         lora_target_modules: Sequence[str] = ("encoder", "output", "value_proj", "time_mlp"),
         normalize_rewards: bool = True,
         max_grad_norm: float = 1.0,
-        kl_logvar_min: float = -20.0,
-        kl_logvar_max: float = 20.0,
-        normalize_objective_by_transitions: bool = True,
-        gradient_mode: str = "direct",
-        transition_chunk_size: int = 0,
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
         self.device = device or diffusion.device
         self.reward_fn = reward_fn
-        self.kl_weight = kl_weight
         self.normalize_rewards = normalize_rewards
         self.max_grad_norm = float(max_grad_norm)
-        self.kl_logvar_min = float(kl_logvar_min)
-        self.kl_logvar_max = float(kl_logvar_max)
-        self.normalize_objective_by_transitions = normalize_objective_by_transitions
-        self.gradient_mode = gradient_mode
-        if self.gradient_mode not in {"direct", "reinforce", "hybrid", "hybrid_st"}:
-            raise ValueError("gradient_mode must be one of: direct, reinforce, hybrid, hybrid_st")
-        self.transition_chunk_size = int(transition_chunk_size)
 
         inject_lora(
             self.diffusion.model,
@@ -297,14 +259,12 @@ class OnlineDDPMLoRAFineTuner:
             times,
         )
         mean, _, log_var = model.q_posterior(x_start, x_t, times)
-        log_var = torch.clamp(log_var, min=self.kl_logvar_min, max=self.kl_logvar_max)
         return mean, log_var, pred_noise, x_start
 
     def rollout(self, batch_size: int, show_progress: bool = False):
         model = self.diffusion
         seq_context = torch.zeros((batch_size, model.seq_len, *model.state_shape), device=self.device)
         generated_states: List[torch.Tensor] = []
-        transitions: List[Dict[str, torch.Tensor]] = []
 
         positions = range(model.seq_len)
         if show_progress:
@@ -326,78 +286,13 @@ class OnlineDDPMLoRAFineTuner:
                     x_prev = x_start
                 else:
                     x_prev = mean + torch.exp(0.5 * log_var) * torch.randn_like(x_t)
-
-                transitions.append(
-                    {
-                        "context": context.detach(),
-                        "key_padding_mask": key_padding_mask.detach(),
-                        "target_indices": target_indices.detach(),
-                        "times": times.detach(),
-                        "x_t": x_t.detach(),
-                        "x_prev": x_prev.detach(),
-                    }
-                )
                 x_t = x_prev
 
             generated_states.append(x_t)
             seq_context[:, pos] = x_t.detach()
 
         seq = torch.stack(generated_states, dim=1)
-        return seq, transitions
-
-    def _compute_logprob_and_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]):
-        transitions = list(transitions)
-        if len(transitions) == 0:
-            raise ValueError("No transitions collected from rollout")
-
-        chunk_size = self.transition_chunk_size if self.transition_chunk_size > 0 else len(transitions)
-        total_log_prob = None
-        total_kl = None
-        num_transitions = 0
-
-        for start_idx in range(0, len(transitions), chunk_size):
-            chunk = transitions[start_idx:start_idx + chunk_size]
-            context = torch.cat([tr["context"] for tr in chunk], dim=0)
-            key_padding_mask = torch.cat([tr["key_padding_mask"] for tr in chunk], dim=0)
-            target_indices = torch.cat([tr["target_indices"] for tr in chunk], dim=0)
-            times = torch.cat([tr["times"] for tr in chunk], dim=0)
-            x_t = torch.cat([tr["x_t"] for tr in chunk], dim=0)
-            x_prev = torch.cat([tr["x_prev"] for tr in chunk], dim=0)
-
-            mean_new, log_var_new, pred_noise_new, _ = self._compute_transition_params(
-                self.diffusion,
-                context,
-                key_padding_mask,
-                target_indices,
-                x_t,
-                times,
-            )
-            log_prob = gaussian_log_prob(x_prev, mean_new, log_var_new)
-
-            with torch.no_grad():
-                _, _, pred_noise_ref, _ = self._compute_transition_params(
-                    self.reference,
-                    context,
-                    key_padding_mask,
-                    target_indices,
-                    x_t,
-                    times,
-                )
-
-            kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
-
-            if total_log_prob is None:
-                total_log_prob = log_prob.sum()
-                total_kl = kl.sum()
-            else:
-                total_log_prob = total_log_prob + log_prob.sum()
-                total_kl = total_kl + kl.sum()
-            num_transitions += log_prob.shape[0]
-
-        total_log_prob = total_log_prob / num_transitions
-        total_kl = total_kl / num_transitions
-
-        return total_log_prob, total_kl
+        return seq
 
     def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None) -> FineTuneStats:
         reward_fn = reward_fn or self.reward_fn
@@ -407,7 +302,7 @@ class OnlineDDPMLoRAFineTuner:
         # Keep policy/reference in eval mode during rollout + KL computation to avoid dropout-induced KL noise.
         self.diffusion.eval()
         self.reference.eval()
-        samples, transitions = self.rollout(batch_size=batch_size, show_progress=False)
+        samples = self.rollout(batch_size=batch_size, show_progress=False)
 
         rewards = reward_fn(samples)
         if not torch.is_tensor(rewards):
@@ -419,23 +314,11 @@ class OnlineDDPMLoRAFineTuner:
         if self.normalize_rewards:
             rewards = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
 
-        log_prob_sum, kl_sum = self._compute_logprob_and_kl(transitions)
-
         reward_loss = -rewards.mean()
-        kl_loss = kl_sum.mean()
-        report_loss = reward_loss + self.kl_weight * kl_loss
-
-        if self.gradient_mode == "direct":
-            grad_objective = report_loss
-            loss = grad_objective
-        else:
-            pg_loss = -(rewards.detach() * log_prob_sum).mean()
-            grad_objective = pg_loss + self.kl_weight * kl_loss
-            if self.gradient_mode == "hybrid_st":
-                # Keep scalar value equal to report_loss, but use surrogate gradient signal.
-                loss = report_loss.detach() + (grad_objective - grad_objective.detach())
-            else:
-                loss = grad_objective
+        kl_loss = torch.zeros((), device=self.device, dtype=reward_loss.dtype)
+        loss = reward_loss
+        grad_objective = reward_loss
+        report_loss = reward_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         skipped_step = 0.0

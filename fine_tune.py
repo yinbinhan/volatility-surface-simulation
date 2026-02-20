@@ -106,6 +106,8 @@ def main():
     parser.add_argument("--transition_chunk_size", type=int, default=0,
                         help="Number of transitions per KL batch (0 = all transitions).")
     parser.add_argument("--results_root", type=str, default=None)
+    parser.add_argument("--normalize_rewards", action="store_true",
+                        help="Normalize rewards to zero mean/unit variance per batch.")
     parser.add_argument("--strict_grid_match", action="store_true", help="Require grid_size to match generated surface resolution")
     args = parser.parse_args()
 
@@ -152,6 +154,7 @@ def main():
         lora_rank=args.lora_rank,
         max_grad_norm=args.max_grad_norm,
         transition_chunk_size=args.transition_chunk_size,
+        normalize_rewards=args.normalize_rewards,
         device=device,
     )
 

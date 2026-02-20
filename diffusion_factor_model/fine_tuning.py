@@ -223,7 +223,7 @@ class OnlineDDPMLoRAFineTuner:
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         lora_target_modules: Sequence[str] = ("encoder", "output", "value_proj", "time_mlp"),
-        normalize_rewards: bool = True,
+        normalize_rewards: bool = False,
         max_grad_norm: float = 1.0,
         transition_chunk_size: int = 0,
         device: Optional[torch.device] = None,

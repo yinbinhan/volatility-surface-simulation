@@ -97,11 +97,14 @@ def main():
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--kl_weight", type=float, default=1e-3)
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--grid_size", type=int, default=5)
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--transition_chunk_size", type=int, default=0,
+                        help="Number of transitions per KL batch (0 = all transitions).")
     parser.add_argument("--results_root", type=str, default=None)
     parser.add_argument("--strict_grid_match", action="store_true", help="Require grid_size to match generated surface resolution")
     args = parser.parse_args()
@@ -145,8 +148,10 @@ def main():
         diffusion,
         reward_fn=reward_fn,
         lr=args.lr,
+        kl_weight=args.kl_weight,
         lora_rank=args.lora_rank,
         max_grad_norm=args.max_grad_norm,
+        transition_chunk_size=args.transition_chunk_size,
         device=device,
     )
 

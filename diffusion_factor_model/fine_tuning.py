@@ -218,19 +218,23 @@ class OnlineDDPMLoRAFineTuner:
         *,
         reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         lr: float = 1e-4,
+        kl_weight: float = 1e-3,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         lora_target_modules: Sequence[str] = ("encoder", "output", "value_proj", "time_mlp"),
         normalize_rewards: bool = True,
         max_grad_norm: float = 1.0,
+        transition_chunk_size: int = 0,
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
         self.device = device or diffusion.device
         self.reward_fn = reward_fn
+        self.kl_weight = float(kl_weight)
         self.normalize_rewards = normalize_rewards
         self.max_grad_norm = float(max_grad_norm)
+        self.transition_chunk_size = int(transition_chunk_size)
 
         inject_lora(
             self.diffusion.model,
@@ -258,13 +262,14 @@ class OnlineDDPMLoRAFineTuner:
             x_t,
             times,
         )
-        mean, _, log_var = model.q_posterior(x_start, x_t, times)
-        return mean, log_var, pred_noise, x_start
+        mean, _, _ = model.q_posterior(x_start, x_t, times)
+        return mean, pred_noise, x_start
 
     def rollout(self, batch_size: int, show_progress: bool = False):
         model = self.diffusion
         seq_context = torch.zeros((batch_size, model.seq_len, *model.state_shape), device=self.device)
         generated_states: List[torch.Tensor] = []
+        transitions: List[Dict[str, torch.Tensor]] = []
 
         positions = range(model.seq_len)
         if show_progress:
@@ -278,21 +283,78 @@ class OnlineDDPMLoRAFineTuner:
                 times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
                 context, key_padding_mask = model.build_context(seq_context, target_indices, x_t)
 
-                mean, log_var, _, x_start = self._compute_transition_params(
+                mean, _, x_start = self._compute_transition_params(
                     model, context, key_padding_mask, target_indices, x_t, times
                 )
 
                 if t == 0:
                     x_prev = x_start
                 else:
+                    _, _, log_var = model.q_posterior(x_start, x_t, times)
                     x_prev = mean + torch.exp(0.5 * log_var) * torch.randn_like(x_t)
+
+                transitions.append(
+                    {
+                        "context": context.detach(),
+                        "key_padding_mask": key_padding_mask.detach(),
+                        "target_indices": target_indices.detach(),
+                        "times": times.detach(),
+                        "x_t": x_t.detach(),
+                    }
+                )
                 x_t = x_prev
 
             generated_states.append(x_t)
             seq_context[:, pos] = x_t.detach()
 
         seq = torch.stack(generated_states, dim=1)
-        return seq
+        return seq, transitions
+
+    def _compute_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]) -> torch.Tensor:
+        transitions = list(transitions)
+        if len(transitions) == 0:
+            raise ValueError("No transitions collected from rollout")
+
+        chunk_size = self.transition_chunk_size if self.transition_chunk_size > 0 else len(transitions)
+        total_kl = None
+        num_transitions = 0
+
+        for start_idx in range(0, len(transitions), chunk_size):
+            chunk = transitions[start_idx:start_idx + chunk_size]
+            context = torch.cat([tr["context"] for tr in chunk], dim=0)
+            key_padding_mask = torch.cat([tr["key_padding_mask"] for tr in chunk], dim=0)
+            target_indices = torch.cat([tr["target_indices"] for tr in chunk], dim=0)
+            times = torch.cat([tr["times"] for tr in chunk], dim=0)
+            x_t = torch.cat([tr["x_t"] for tr in chunk], dim=0)
+
+            _, pred_noise_new, _ = self._compute_transition_params(
+                self.diffusion,
+                context,
+                key_padding_mask,
+                target_indices,
+                x_t,
+                times,
+            )
+
+            with torch.no_grad():
+                _, pred_noise_ref, _ = self._compute_transition_params(
+                    self.reference,
+                    context,
+                    key_padding_mask,
+                    target_indices,
+                    x_t,
+                    times,
+                )
+
+            kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
+
+            if total_kl is None:
+                total_kl = kl.sum()
+            else:
+                total_kl = total_kl + kl.sum()
+            num_transitions += kl.shape[0]
+
+        return total_kl / num_transitions
 
     def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None) -> FineTuneStats:
         reward_fn = reward_fn or self.reward_fn
@@ -302,7 +364,7 @@ class OnlineDDPMLoRAFineTuner:
         # Keep policy/reference in eval mode during rollout + KL computation to avoid dropout-induced KL noise.
         self.diffusion.eval()
         self.reference.eval()
-        samples = self.rollout(batch_size=batch_size, show_progress=False)
+        samples, transitions = self.rollout(batch_size=batch_size, show_progress=False)
 
         rewards = reward_fn(samples)
         if not torch.is_tensor(rewards):
@@ -315,10 +377,10 @@ class OnlineDDPMLoRAFineTuner:
             rewards = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
 
         reward_loss = -rewards.mean()
-        kl_loss = torch.zeros((), device=self.device, dtype=reward_loss.dtype)
-        loss = reward_loss
-        grad_objective = reward_loss
-        report_loss = reward_loss
+        kl_loss = self._compute_kl(transitions)
+        report_loss = reward_loss + self.kl_weight * kl_loss
+        grad_objective = report_loss
+        loss = report_loss
 
         self.optimizer.zero_grad(set_to_none=True)
         skipped_step = 0.0

@@ -104,6 +104,8 @@ def main():
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--results_root", type=str, default=None)
+    parser.add_argument("--gradient_mode", type=str, default="hybrid", choices=["direct", "reinforce", "hybrid"])
+    parser.add_argument("--strict_grid_match", action="store_true", help="Require grid_size to match generated surface resolution")
     args = parser.parse_args()
 
     timestamp = int(time.time())
@@ -138,7 +140,7 @@ def main():
 
     m_vals = np.linspace(0.8, 1.2, args.grid_size)
     t_vals = np.linspace(0.1, 2.0, args.grid_size)
-    validator = ArbitrageValidator(m_vals, t_vals)
+    validator = ArbitrageValidator(m_vals, t_vals, strict_grid_match=args.strict_grid_match)
     reward_fn = make_arbitrage_reward_fn(validator)
 
     tuner = OnlineDDPMLoRAFineTuner(

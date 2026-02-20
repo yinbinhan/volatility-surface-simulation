@@ -141,11 +141,22 @@ class FineTuneStats:
 class ArbitrageValidator:
     """Arbitrage-violation calculator for generated volatility/price surfaces."""
 
-    def __init__(self, grid_m, grid_t):
+    def __init__(self, grid_m, grid_t, *, strict_grid_match: bool = False, eps: float = 1e-8):
         self.m = torch.tensor(grid_m, dtype=torch.float32)
         self.t = torch.tensor(grid_t, dtype=torch.float32)
+        if self.m.ndim != 1 or self.t.ndim != 1:
+            raise ValueError("grid_m and grid_t must be 1D arrays")
+        if len(self.m) < 2 or len(self.t) < 2:
+            raise ValueError("grid_m and grid_t must have at least two points")
+        if not torch.all(self.m[1:] > self.m[:-1]):
+            raise ValueError("grid_m must be strictly increasing")
+        if not torch.all(self.t[1:] > self.t[:-1]):
+            raise ValueError("grid_t must be strictly increasing")
+
         self.dt = self.t[1:] - self.t[:-1]
         self.dm = self.m[1:] - self.m[:-1]
+        self.strict_grid_match = strict_grid_match
+        self.eps = float(eps)
 
     def per_sample_total_violation(self, tensor_5d: torch.Tensor) -> torch.Tensor:
         if isinstance(tensor_5d, np.ndarray):
@@ -167,22 +178,28 @@ class ArbitrageValidator:
                 f"ArbitrageValidator expects at least 2 channels and uses channel index 1 for price, got C={channels}"
             )
 
-        # If provided grids do not match generated surface resolution, adapt them to preserve endpoints.
-        if height != len(t):
-            t = torch.linspace(float(t[0].item()), float(t[-1].item()), steps=height, device=device, dtype=prices.dtype)
-            dt = t[1:] - t[:-1]
-        if width != len(self.m):
-            m = torch.linspace(float(self.m[0].item()), float(self.m[-1].item()), steps=width, device=device, dtype=prices.dtype)
-            dm = m[1:] - m[:-1]
+        # Grid handling for resolution mismatch between configured grid and generated surfaces.
+        if height != len(t) or width != len(self.m):
+            if self.strict_grid_match:
+                raise ValueError(
+                    f"Grid/data resolution mismatch: got HxW={height}x{width}, expected {len(t)}x{len(self.m)}. "
+                    "Set strict_grid_match=False to auto-resample grid."
+                )
+            if height != len(t):
+                t = torch.linspace(float(t[0].item()), float(t[-1].item()), steps=height, device=device, dtype=prices.dtype)
+                dt = t[1:] - t[:-1]
+            if width != len(self.m):
+                m = torch.linspace(float(self.m[0].item()), float(self.m[-1].item()), steps=width, device=device, dtype=prices.dtype)
+                dm = m[1:] - m[:-1]
 
         prices = prices[:, :, 1, :, :].reshape(batch_size * seq_len, height, width)
 
         diff_t = prices[:, :-1, :] - prices[:, 1:, :]
-        l1_map = torch.relu(t[:-1].view(1, -1, 1) * diff_t / dt.view(1, -1, 1))
+        l1_map = torch.relu(t[:-1].view(1, -1, 1) * diff_t / dt.clamp_min(self.eps).view(1, -1, 1))
         l1 = torch.sum(l1_map, dim=(1, 2))
 
         diff_m = prices[:, :, 1:] - prices[:, :, :-1]
-        slope = diff_m / dm.view(1, 1, -1)
+        slope = diff_m / dm.clamp_min(self.eps).view(1, 1, -1)
         l2_map = torch.relu(slope)
         l2 = torch.sum(l2_map, dim=(1, 2))
 

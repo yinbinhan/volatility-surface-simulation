@@ -106,7 +106,7 @@ def main():
     parser.add_argument("--kl_logvar_min", type=float, default=-20.0)
     parser.add_argument("--kl_logvar_max", type=float, default=20.0)
     parser.add_argument("--results_root", type=str, default=None)
-    parser.add_argument("--gradient_mode", type=str, default="hybrid", choices=["direct", "reinforce", "hybrid"])
+    parser.add_argument("--gradient_mode", type=str, default="hybrid", choices=["direct", "reinforce", "hybrid", "hybrid_st"])
     parser.add_argument("--strict_grid_match", action="store_true", help="Require grid_size to match generated surface resolution")
     args = parser.parse_args()
 

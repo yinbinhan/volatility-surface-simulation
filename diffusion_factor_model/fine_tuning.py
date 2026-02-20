@@ -265,8 +265,8 @@ class OnlineDDPMLoRAFineTuner:
         self.kl_logvar_max = float(kl_logvar_max)
         self.normalize_objective_by_transitions = normalize_objective_by_transitions
         self.gradient_mode = gradient_mode
-        if self.gradient_mode not in {"direct", "reinforce", "hybrid"}:
-            raise ValueError("gradient_mode must be one of: direct, reinforce, hybrid")
+        if self.gradient_mode not in {"direct", "reinforce", "hybrid", "hybrid_st"}:
+            raise ValueError("gradient_mode must be one of: direct, reinforce, hybrid, hybrid_st")
 
         inject_lora(
             self.diffusion.model,
@@ -409,13 +409,19 @@ class OnlineDDPMLoRAFineTuner:
 
         reward_loss = -rewards.mean()
         kl_loss = kl_sum.mean()
+        report_loss = reward_loss + self.kl_weight * kl_loss
+
         if self.gradient_mode == "direct":
-            grad_objective = reward_loss
+            grad_objective = report_loss
+            loss = grad_objective
         else:
             pg_loss = -(rewards.detach() * log_prob_sum).mean()
-            grad_objective = pg_loss
-        loss = grad_objective + self.kl_weight * kl_loss
-        report_loss = reward_loss + self.kl_weight * kl_loss
+            grad_objective = pg_loss + self.kl_weight * kl_loss
+            if self.gradient_mode == "hybrid_st":
+                # Keep scalar value equal to report_loss, but use surrogate gradient signal.
+                loss = report_loss.detach() + (grad_objective - grad_objective.detach())
+            else:
+                loss = grad_objective
 
         self.optimizer.zero_grad(set_to_none=True)
         skipped_step = 0.0

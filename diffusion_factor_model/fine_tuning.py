@@ -253,6 +253,7 @@ class OnlineDDPMLoRAFineTuner:
         kl_logvar_max: float = 20.0,
         normalize_objective_by_transitions: bool = True,
         gradient_mode: str = "direct",
+        transition_chunk_size: int = 0,
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
@@ -267,6 +268,7 @@ class OnlineDDPMLoRAFineTuner:
         self.gradient_mode = gradient_mode
         if self.gradient_mode not in {"direct", "reinforce", "hybrid", "hybrid_st"}:
             raise ValueError("gradient_mode must be one of: direct, reinforce, hybrid, hybrid_st")
+        self.transition_chunk_size = int(transition_chunk_size)
 
         inject_lora(
             self.diffusion.model,
@@ -344,44 +346,56 @@ class OnlineDDPMLoRAFineTuner:
         return seq, transitions
 
     def _compute_logprob_and_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]):
+        transitions = list(transitions)
+        if len(transitions) == 0:
+            raise ValueError("No transitions collected from rollout")
+
+        chunk_size = self.transition_chunk_size if self.transition_chunk_size > 0 else len(transitions)
         total_log_prob = None
         total_kl = None
         num_transitions = 0
 
-        for tr in transitions:
+        for start_idx in range(0, len(transitions), chunk_size):
+            chunk = transitions[start_idx:start_idx + chunk_size]
+            context = torch.cat([tr["context"] for tr in chunk], dim=0)
+            key_padding_mask = torch.cat([tr["key_padding_mask"] for tr in chunk], dim=0)
+            target_indices = torch.cat([tr["target_indices"] for tr in chunk], dim=0)
+            times = torch.cat([tr["times"] for tr in chunk], dim=0)
+            x_t = torch.cat([tr["x_t"] for tr in chunk], dim=0)
+            x_prev = torch.cat([tr["x_prev"] for tr in chunk], dim=0)
+
             mean_new, log_var_new, pred_noise_new, _ = self._compute_transition_params(
                 self.diffusion,
-                tr["context"],
-                tr["key_padding_mask"],
-                tr["target_indices"],
-                tr["x_t"],
-                tr["times"],
+                context,
+                key_padding_mask,
+                target_indices,
+                x_t,
+                times,
             )
-            log_prob = gaussian_log_prob(tr["x_prev"], mean_new, log_var_new)
+            log_prob = gaussian_log_prob(x_prev, mean_new, log_var_new)
 
             with torch.no_grad():
                 _, _, pred_noise_ref, _ = self._compute_transition_params(
                     self.reference,
-                    tr["context"],
-                    tr["key_padding_mask"],
-                    tr["target_indices"],
-                    tr["x_t"],
-                    tr["times"],
+                    context,
+                    key_padding_mask,
+                    target_indices,
+                    x_t,
+                    times,
                 )
 
             kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
 
             if total_log_prob is None:
-                total_log_prob = log_prob
-                total_kl = kl
+                total_log_prob = log_prob.sum()
+                total_kl = kl.sum()
             else:
-                total_log_prob = total_log_prob + log_prob
-                total_kl = total_kl + kl
-            num_transitions += 1
+                total_log_prob = total_log_prob + log_prob.sum()
+                total_kl = total_kl + kl.sum()
+            num_transitions += log_prob.shape[0]
 
-        if self.normalize_objective_by_transitions and num_transitions > 0:
-            total_log_prob = total_log_prob / num_transitions
-            total_kl = total_kl / num_transitions
+        total_log_prob = total_log_prob / num_transitions
+        total_kl = total_kl / num_transitions
 
         return total_log_prob, total_kl
 

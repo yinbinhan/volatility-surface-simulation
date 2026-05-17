@@ -54,6 +54,74 @@ python train.py --data_path /path/to/simulation_experiment_data/training_data_ex
 python train.py --data_path /path/to/empirical_analysis_data/training_data_example.npy --seed 42 --gpu 0
 ```
 
+## OptionMetrics Volatility-Surface Hedging Workflow
+
+For the SPX volatility-surface hedging experiments, start from raw OptionMetrics files and build the shared-grid dataset used by diffusion and the hedging layer.
+
+Expected raw-data layout:
+
+```text
+data/optionmetrics_spx_20000103_20230228/
+  raw_options/spx_options_YYYY.csv.gz
+  underlying/spx_secprd_YYYY.csv.gz
+```
+
+Build daily 11x9 shared-grid surfaces:
+
+```bash
+python shared_grid_preprocessing.py \
+  --data-root data/optionmetrics_spx_20000103_20230228 \
+  --output-dir data/processed_shared_grid_11x9 \
+  --self-check
+```
+
+Build matched IV-only diffusion windows, with 21 observed trading days and the next day as the generated target:
+
+```bash
+python prepare_shared_grid_data.py \
+  --processed-dir data/processed_shared_grid_11x9 \
+  --output-dir data/shared_grid_iv_22 \
+  --channel-mode iv \
+  --seq-len 22 \
+  --conditioning-length 21 \
+  --self-check
+```
+
+Train and sample diffusion:
+
+```bash
+python train.py \
+  --data_path data/shared_grid_iv_22/shared_grid_30d_logiv_return.npy \
+  --conditioning_path data/shared_grid_iv_22/shared_grid_30d_conditioning.npy \
+  --conditioning_length 21 \
+  --gpu 0
+```
+
+Generated samples are written under `samples/dfm_*`. The first `conditioning_length` days are fixed from the observed prefix, and the next index is generated. These samples can be converted into hedging scenarios through `hedging.py` using `IVSurfaceScenarios`.
+
+For the paper-style call-price setup, use:
+
+```bash
+python prepare_shared_grid_data.py \
+  --processed-dir data/processed_shared_grid_11x9 \
+  --output-dir data/shared_grid_call_30 \
+  --channel-mode paper \
+  --seq-len 30 \
+  --conditioning-length 29 \
+  --self-check
+```
+
+Run hedging component checks:
+
+```bash
+python hedging.py --solver-self-check
+python hedging.py --scenario-adapter-self-check
+python hedging.py --backtest-self-check
+python hedging.py --paper-output-self-check
+```
+
+See `SHARED_GRID_HEDGING_WORKFLOW.md` for the concise end-to-end checklist. Full hedging performance evaluation still requires trained checkpoints plus an exporter that emits `K` one-day-ahead scenarios per hedge date.
+
 ### Supported Data Formats
 
 1. **Empirical data**: Shape `(samples, assets)` - e.g., `(1024, 512)` 

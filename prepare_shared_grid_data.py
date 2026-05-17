@@ -19,9 +19,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conditioning-length", type=int, default=29)
     parser.add_argument(
         "--channel-mode",
-        choices=["paper", "legacy", "custom"],
+        choices=["paper", "iv", "legacy", "custom"],
         default="paper",
-        help="paper: log_iv, call_mid_over_s, log_return_broadcast; legacy: log_iv, log_return_broadcast; custom: use --channels.",
+        help="paper: log_iv, call_mid_over_s, log_return_broadcast; iv: log_iv, log_return_broadcast; legacy: alias for iv; custom: use --channels.",
     )
     parser.add_argument(
         "--channels",
@@ -71,7 +71,7 @@ def build_channel_array(tensor: np.lib.npyio.NpzFile, channel: str) -> np.ndarra
 def channels_for_mode(args: argparse.Namespace) -> list[str]:
     if args.channel_mode == "paper":
         return ["log_iv", "call_mid_over_s", "log_return_broadcast"]
-    if args.channel_mode == "legacy":
+    if args.channel_mode in {"iv", "legacy"}:
         return ["log_iv", "log_return_broadcast"]
     if args.channels is None:
         raise ValueError("--channels is required when --channel-mode custom")
@@ -139,6 +139,7 @@ def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_date
         "axis_convention": {"H": "tau/maturity", "W": "moneyness"},
         "channels": args.channels_list,
         "channel_mode": args.channel_mode,
+        "conditioning_target": "next_trading_day_after_observed_prefix",
         "seq_len": args.seq_len,
         "conditioning_length": args.conditioning_length,
         "target_index": args.conditioning_length,

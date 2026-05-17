@@ -17,6 +17,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="data/shared_grid_11x9")
     parser.add_argument("--seq-len", type=int, default=30)
     parser.add_argument("--conditioning-length", type=int, default=29)
+    parser.add_argument(
+        "--channel-mode",
+        choices=["paper", "legacy", "custom"],
+        default="paper",
+        help="paper: log_iv, call_mid_over_s, log_return_broadcast; legacy: log_iv, log_return_broadcast; custom: use --channels.",
+    )
+    parser.add_argument(
+        "--channels",
+        default=None,
+        help="Comma-separated channels for --channel-mode custom. Supported: log_iv, call_mid_over_s, log_return_broadcast.",
+    )
     parser.add_argument("--self-check", action="store_true")
     return parser.parse_args()
 
@@ -35,34 +46,82 @@ def load_shared_grid(processed_dir: Path) -> tuple[dict, np.lib.npyio.NpzFile]:
     return grid, tensor
 
 
-def build_windows(tensor: np.lib.npyio.NpzFile, seq_len: int) -> tuple[np.ndarray, np.ndarray]:
+def parse_channels(channels_text: str) -> list[str]:
+    channels = [item.strip() for item in channels_text.split(",") if item.strip()]
+    supported = {"log_iv", "call_mid_over_s", "log_return_broadcast"}
+    unknown = [channel for channel in channels if channel not in supported]
+    if unknown:
+        raise ValueError(f"unsupported channels: {unknown}; supported channels are {sorted(supported)}")
+    if not channels:
+        raise ValueError("at least one channel is required")
+    return channels
+
+
+def build_channel_array(tensor: np.lib.npyio.NpzFile, channel: str) -> np.ndarray:
+    if channel == "log_return_broadcast":
+        log_iv = np.asarray(tensor["log_iv"], dtype=np.float32)
+        values = np.asarray(tensor["log_return"], dtype=np.float32)
+        return np.broadcast_to(values[:, None, None], log_iv.shape).astype(np.float32)
+    values = np.asarray(tensor[channel], dtype=np.float32)
+    if channel == "call_mid_over_s" and np.any(values < 0):
+        raise ValueError("call_mid_over_s contains negative values")
+    return values
+
+
+def channels_for_mode(args: argparse.Namespace) -> list[str]:
+    if args.channel_mode == "paper":
+        return ["log_iv", "call_mid_over_s", "log_return_broadcast"]
+    if args.channel_mode == "legacy":
+        return ["log_iv", "log_return_broadcast"]
+    if args.channels is None:
+        raise ValueError("--channels is required when --channel-mode custom")
+    return parse_channels(args.channels)
+
+
+def channel_slug(channels: list[str]) -> str:
+    if channels == ["log_iv", "call_mid_over_s", "log_return_broadcast"]:
+        return "logiv_call_return"
+    if channels == ["log_iv", "log_return_broadcast"]:
+        return "logiv_return"
+    parts = []
+    for channel in channels:
+        parts.append(
+            channel.replace("_mid_over_s", "")
+            .replace("_broadcast", "")
+            .replace("log_iv", "logiv")
+            .replace("log_return", "return")
+        )
+    return "_".join(parts)
+
+
+def build_windows(tensor: np.lib.npyio.NpzFile, seq_len: int, channels: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    channel_arrays = [build_channel_array(tensor, channel) for channel in channels]
     log_iv = np.asarray(tensor["log_iv"], dtype=np.float32)
-    log_return = np.asarray(tensor["log_return"], dtype=np.float32)
     dates = np.asarray(tensor["dates"]).astype(str)
     if log_iv.ndim != 3:
         raise ValueError(f"log_iv must have shape [T, moneyness, tau], got {log_iv.shape}")
-    if log_iv.shape[0] != log_return.shape[0] or log_iv.shape[0] != dates.shape[0]:
-        raise ValueError("date, log_iv, and log_return lengths do not agree")
+    if any(arr.shape != log_iv.shape for arr in channel_arrays):
+        raise ValueError("all selected channels must have shape [T, moneyness, tau]")
+    if log_iv.shape[0] != dates.shape[0]:
+        raise ValueError("date and tensor lengths do not agree")
     if log_iv.shape[0] < seq_len:
         raise ValueError(f"need at least {seq_len} accepted dates, got {log_iv.shape[0]}")
-    if not np.all(np.isfinite(log_iv)) or not np.all(np.isfinite(log_return)):
-        raise ValueError("non-finite log_iv or log_return in shared-grid tensor")
+    if any(not np.all(np.isfinite(arr)) for arr in channel_arrays):
+        raise ValueError("non-finite selected channel in shared-grid tensor")
 
     num_windows = log_iv.shape[0] - seq_len + 1
-    windows = np.empty((num_windows, seq_len, 2, log_iv.shape[2], log_iv.shape[1]), dtype=np.float32)
+    windows = np.empty((num_windows, seq_len, len(channels), log_iv.shape[2], log_iv.shape[1]), dtype=np.float32)
     window_dates = np.empty((num_windows, seq_len), dtype=object)
     for i in range(num_windows):
-        iv_path = log_iv[i : i + seq_len]
-        rtn_path = log_return[i : i + seq_len]
-        windows[i, :, 0] = np.transpose(iv_path, (0, 2, 1))
-        windows[i, :, 1] = rtn_path[:, None, None]
+        for channel_index, arr in enumerate(channel_arrays):
+            windows[i, :, channel_index] = np.transpose(arr[i : i + seq_len], (0, 2, 1))
         window_dates[i] = dates[i : i + seq_len]
     return windows, window_dates.astype(str)
 
 
 def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_dates: np.ndarray, args: argparse.Namespace) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
-    data_path = output_dir / "shared_grid_30d_logiv_return.npy"
+    data_path = output_dir / f"shared_grid_30d_{channel_slug(args.channels_list)}.npy"
     conditioning_path = output_dir / "shared_grid_30d_conditioning.npy"
     dates_path = output_dir / "shared_grid_30d_dates.npy"
     metadata_path = output_dir / "shared_grid_30d_metadata.json"
@@ -78,7 +137,8 @@ def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_date
         "shape": list(windows.shape),
         "layout": "N,S,C,H,W",
         "axis_convention": {"H": "tau/maturity", "W": "moneyness"},
-        "channels": ["log_iv", "log_return_broadcast"],
+        "channels": args.channels_list,
+        "channel_mode": args.channel_mode,
         "seq_len": args.seq_len,
         "conditioning_length": args.conditioning_length,
         "target_index": args.conditioning_length,
@@ -88,8 +148,8 @@ def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_date
         "window_stride": 1,
         "dtype": str(windows.dtype),
         "min_max": {
-            "log_iv": [float(windows[:, :, 0].min()), float(windows[:, :, 0].max())],
-            "log_return": [float(windows[:, :, 1].min()), float(windows[:, :, 1].max())],
+            channel: [float(windows[:, :, i].min()), float(windows[:, :, i].max())]
+            for i, channel in enumerate(args.channels_list)
         },
         "recommended_train_command": (
             "python train.py --data_path {data} --conditioning_path {cond} "
@@ -100,36 +160,43 @@ def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_date
     return metadata
 
 
-def self_check(output_dir: Path, expected_seq_len: int, expected_conditioning_length: int) -> None:
-    data = np.load(output_dir / "shared_grid_30d_logiv_return.npy")
+def self_check(output_dir: Path, expected_seq_len: int, expected_conditioning_length: int, channels: list[str]) -> None:
+    data = np.load(output_dir / f"shared_grid_30d_{channel_slug(channels)}.npy")
     cond = np.load(output_dir / "shared_grid_30d_conditioning.npy")
     dates = np.load(output_dir / "shared_grid_30d_dates.npy", allow_pickle=True)
     metadata = json.loads((output_dir / "shared_grid_30d_metadata.json").read_text())
     assert data.shape == cond.shape
     assert data.ndim == 5
-    assert data.shape[1:] == (expected_seq_len, 2, 9, 11)
+    assert data.shape[1] == expected_seq_len
+    assert data.shape[2] == len(metadata["channels"])
+    assert data.shape[2] == len(channels)
+    assert data.shape[3:] == (9, 11)
     assert dates.shape[:2] == data.shape[:2]
     assert np.all(np.isfinite(data))
     assert np.allclose(data, cond)
     assert metadata["layout"] == "N,S,C,H,W"
     assert metadata["axis_convention"] == {"H": "tau/maturity", "W": "moneyness"}
     assert metadata["conditioning_length"] == expected_conditioning_length
-    assert metadata["channels"] == ["log_iv", "log_return_broadcast"]
+    assert metadata["channels"] == channels
     assert len(metadata["moneyness_grid"]) == 11
     assert len(metadata["tau_grid"]) == 9
+    if "call_mid_over_s" in channels:
+        call_index = channels.index("call_mid_over_s")
+        assert np.all(data[:, :, call_index] >= 0)
 
 
 def main() -> None:
     args = parse_args()
     if args.conditioning_length < 0 or args.conditioning_length >= args.seq_len:
         raise ValueError("--conditioning-length must be between 0 and seq_len - 1")
+    args.channels_list = channels_for_mode(args)
     processed_dir = Path(args.processed_dir)
     output_dir = Path(args.output_dir)
     grid, tensor = load_shared_grid(processed_dir)
-    windows, dates = build_windows(tensor, args.seq_len)
+    windows, dates = build_windows(tensor, args.seq_len, args.channels_list)
     metadata = write_outputs(output_dir, grid, windows, dates, args)
     if args.self_check:
-        self_check(output_dir, args.seq_len, args.conditioning_length)
+        self_check(output_dir, args.seq_len, args.conditioning_length, args.channels_list)
         print("SHARED_GRID_DIFFUSION_DATA_SELF_CHECK=PASS")
     print(json.dumps({"data_path": metadata["data_path"], "conditioning_path": metadata["conditioning_path"], "shape": metadata["shape"]}, sort_keys=True))
 

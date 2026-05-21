@@ -11,6 +11,7 @@ import argparse
 import time
 import json
 import subprocess
+import math
 from tqdm import tqdm
 
 
@@ -371,17 +372,36 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     
     config.set_seed(seed)  # Reset seed for reproducibility
     
+    if conditioning_source is not None:
+        sample_batches = math.ceil(conditioning_source.shape[0] / samples_per_batch)
+        print(f"Using {conditioning_source.shape[0]} conditioning sequences across {sample_batches} sample batches")
+        conditioning_mask = torch.zeros((seq_len,), dtype=torch.bool)
+        conditioning_mask[:conditioning_length] = True
+
     for i in range(sample_batches):
         # Pass save_timesteps parameter to sample method for early stopping evaluation
+        cond_batch = None
+        cond_mask = None
+        current_batch_size = samples_per_batch
+        if conditioning_source is not None:
+            start = i * samples_per_batch
+            end = min(conditioning_source.shape[0], start + samples_per_batch)
+            cond_batch = conditioning_source[start:end].to(diffusion.device)
+            current_batch_size = cond_batch.shape[0]
+            cond_mask = conditioning_mask.to(diffusion.device)
         try:
             samples = diffusion.sample(
-                batch_size=samples_per_batch,
+                batch_size=current_batch_size,
                 save_timesteps=save_timesteps,
+                conditioning=cond_batch,
+                conditioning_mask=cond_mask,
+                start_idx=conditioning_length if conditioning_source is not None else 0,
+                end_idx=seq_len,
                 show_progress=True,
                 progress_desc=f"Sampling batch {i+1}/{sample_batches}",
             )
         except TypeError:
-            samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps)
+            samples = diffusion.sample(batch_size=current_batch_size, save_timesteps=save_timesteps)
         samples = samples.cpu()
         # Keep native sequential state shape, e.g. [batch, seq_len, channel, height, width]
         samples = samples * data_std.to(samples.device) + data_mean.to(samples.device)

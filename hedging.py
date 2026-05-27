@@ -1398,6 +1398,9 @@ def run_daily_backtest(
     cumulative_z: dict[str, float] = {strategy: 0.0 for strategy in requested}
     rows = []
     skipped_frames = []
+    # g0 = initial portfolio value, fixed at window open (paper §3 eq.20).
+    # Set from the first complete interval's start-date prices; never updated.
+    g0_scale: float | None = None
 
     for start_date, end_date in zip(panel.trading_dates[:-1], panel.trading_dates[1:]):
         current_target, current_hedges, next_target, next_hedges, missing = _complete_interval_quotes(panel, start_date, end_date)
@@ -1416,10 +1419,10 @@ def run_daily_backtest(
         hedge_vega = pd.to_numeric(current_hedges['vega'], errors='coerce').to_numpy(dtype=float)
         target_change = float(np.sum(next_target_mid - current_target_mid))
         hedge_changes = next_hedge_mid - current_hedge_mid
-        # g_0 = V_t = current portfolio value (paper eq.20 penalty scaling).
-        g0_scale = float(np.sum(current_target_mid))
-        if g0_scale <= 0:
-            g0_scale = 1.0
+        if g0_scale is None:
+            g0_scale = float(np.sum(current_target_mid))
+            if g0_scale <= 0:
+                g0_scale = 1.0
 
         if 'lasso' in requested:
             scenario_output = _scenario_source_output(scenario_source, panel, start_date, end_date, current_target, current_hedges)
@@ -1563,9 +1566,9 @@ def tracking_error_summary(summary: BacktestSummary) -> pd.DataFrame:
             'terminal_count': int(terminal_z.size),
             'terminal_mean': float(np.mean(terminal_z)) if terminal_z.size else float('nan'),
             'terminal_std': float(np.std(terminal_z, ddof=0)) if terminal_z.size > 1 else float('nan'),
-            'terminal_var_5pct': float(np.percentile(terminal_z, 5)) if terminal_z.size else float('nan'),
-            'terminal_var_2_5pct': float(np.percentile(terminal_z, 2.5)) if terminal_z.size else float('nan'),
-            'terminal_var_1pct': float(np.percentile(terminal_z, 1)) if terminal_z.size else float('nan'),
+            'terminal_var_5pct': float(-np.percentile(terminal_z, 5)) if terminal_z.size else float('nan'),
+            'terminal_var_2_5pct': float(-np.percentile(terminal_z, 2.5)) if terminal_z.size else float('nan'),
+            'terminal_var_1pct': float(-np.percentile(terminal_z, 1)) if terminal_z.size else float('nan'),
         }
         rows.append(row)
     return _strategy_sort_frame(pd.DataFrame(rows, columns=columns))
@@ -1720,7 +1723,7 @@ def run_full_backtest(
     n_val: int = 100,
     alpha_grid: np.ndarray | None = None,
     strategies: tuple[str, ...] = ('lasso', 'delta', 'delta_vega'),
-    target_days: int = 23,
+    target_days: int = 30,
 ) -> pd.DataFrame:
     """Run 52-window paper backtest and return terminal Z_T per window and m0.
 

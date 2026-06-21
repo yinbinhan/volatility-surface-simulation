@@ -1,88 +1,308 @@
-# 🌊 Diffusion Factor Model
+# Volatility Surface Simulation and Hedging
 
-<p align="center">
-  <img src="assets/demo.png" alt="Diffusion Factor Model Demo" width="700"/>
-</p>
+This repository contains the diffusion-model side of the SPX volatility-surface
+experiments. It builds daily OptionMetrics surfaces on the same fixed grid used
+for the VolGAN comparison, trains a sequential diffusion model, samples
+one-step-ahead surface scenarios, and provides the hedging utilities needed to
+turn generated scenarios into LASSO hedge inputs.
 
-This repository implements a Diffusion Factor Model for financial data.
+The intended workflow is:
 
-## 📝 Summary
+1. Start from raw OptionMetrics SPX option quotes and SPX underlying files.
+2. Build a shared 11 x 9 volatility/price surface dataset.
+3. Convert the daily surfaces into rolling diffusion windows.
+4. Train and sample the diffusion model.
+5. Convert generated surfaces into hedging scenarios.
 
-Diffusion Factor Model (DFM) is a novel approach that adapts diffusion models to generate new financial returns with realistic factor structure. It achieves superior performance in preserving the statistical properties and latent factor patterns of financial data, making it valuable for portfolio optimization and risk management applications.
+## Repository Layout
 
-## ✨ Features
+```text
+.
+├── shared_grid_preprocessing.py      # Raw OptionMetrics -> daily 11 x 9 surfaces
+├── prepare_shared_grid_data.py       # Daily surfaces -> rolling diffusion windows
+├── train.py                          # Sequential diffusion training and sampling
+├── hedging.py                        # Instrument panels, scenario adapters, LASSO hedging
+├── diffusion_factor_model/           # Sequential diffusion model implementation
+├── config/config.py                  # Training and sampling defaults
+├── SHARED_GRID_HEDGING_WORKFLOW.md   # Short checklist version of this workflow
+└── requirements.txt
+```
 
-- 📊 Diffusion models adapted for financial data with factor structure
-- 🔄 Support for both simulation data (num_samples, height, width) and empirical data (num_samples, length) formats
-- 📐 Automatic adaptation to different input dimensions
-- 💹 Portfolio optimization evaluation framework
-- 📈 Factor recovery evaluation metrics
+## Installation
 
-## 🔧 Installation
+Create a Python environment with PyTorch and the package requirements.
 
 ```bash
-git clone https://github.com/xymmmm00/diffusion_factor_model.git
-cd diffusion-factor-model
+git clone https://github.com/yinbinhan/volatility-surface-simulation.git
+cd volatility-surface-simulation
 pip install -r requirements.txt
 ```
 
-For portfolio optimization, MOSEK requires a license (free for academic use).
+Use a CUDA-enabled PyTorch build if training on GPU. The code has been smoke
+tested on GPU with the shared-grid data path.
 
-## 📁 Project Structure
+## Raw Data Layout
 
+The preprocessing scripts expect the OptionMetrics/SPX files in this layout:
+
+```text
+data/optionmetrics_spx_20000103_20230228/
+  raw_options/
+    spx_options_YYYY.csv.gz
+  underlying/
+    spx_secprd_YYYY.csv.gz
 ```
-diffusion-factor-model/
-├── config/                      # Configuration settings
-├── diffusion_factor_model/      # Core model implementation
-├── eval/                        # Evaluation modules
-├── simulation_experiment_data/  # Simulation data storage
-├── empirical_analysis_data/     # Empirical data storage
-├── model_results/               # Trained models (created automatically)
-├── samples/                     # Generated samples (created automatically)
-└── train.py                     # Main training script
-```
 
-## 🚀 Training
+The option files should contain the usual OptionMetrics fields used by
+`shared_grid_preprocessing.py` and `hedging.py`, including date, expiry, call/put
+flag, strike, bid, offer, implied volatility, delta, vega, volume, and open
+interest. The underlying files should contain daily SPX closes.
 
-The training script automatically detects data format and adapts the model architecture accordingly.
+Large raw data files and generated artifacts should stay outside Git.
+
+## Step 1: Build Shared Daily Surfaces
+
+Run:
 
 ```bash
-# Train with simulation data:
-python train.py --data_path /path/to/simulation_experiment_data/training_data_example.npy --seed 42 --gpu 0
-
-# Train with empirical data:
-python train.py --data_path /path/to/empirical_analysis_data/training_data_example.npy --seed 42 --gpu 0
+python shared_grid_preprocessing.py \
+  --data-root data/optionmetrics_spx_20000103_20230228 \
+  --output-dir data/processed_shared_grid_11x9 \
+  --self-check
 ```
 
-### Supported Data Formats
+This builds the fixed grid:
 
-1. **Empirical data**: Shape `(samples, assets)` - e.g., `(1024, 512)` 
-2. **Simulation data**: Shape `(samples, height, width)` - e.g., `(512, 32, 64)`
+- Moneyness: `0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3, 1.4`
+- Maturity in years: `1/252, 1/52, 2/52, 1/12, 1/6, 1/4, 1/2, 3/4, 1`
 
-## 📊 Evaluation
+The output directory contains:
 
-The repository includes evaluation modules for:
-
-1. **Mean and Covariance Calculation** - With winsorization and shrinkage estimation
-2. **Simulation Evaluation** - Comparing generated distributions (both return and latent subspace) with ground truth
-3. **Mean-Variance Portfolio Evaluation** - Creating mean-variance portfolios with performance metrics
-4. **Factor Timing Portfolio Evaluation** - Using PCA, POET, RP-PCA for factor-based portfolios
-
-<p align="center">
-  <img src="assets/distribution_example.png">
-</p>
-
-<p align="center">
-  <img src="assets/portfolio_example.png">
-</p>
-
-## 📚 Citation
-
+```text
+data/processed_shared_grid_11x9/
+  grid_config.json
+  surface_tensor.npz
+  spx_daily.csv.gz
+  iv_surfaces.csv.gz
+  price_surfaces.csv.gz
+  audit_manifest.json
 ```
-@article{chen2025diffusion,
-  title={Diffusion Factor Models: Generating High-Dimensional Returns with Factor Structure},
-  author={Chen, Minshuo and Xu, Renyuan and Xu, Yumin and Zhang, Ruixun},
-  journal={arXiv preprint arXiv:2504.06566},
-  year={2025}
-}
+
+`surface_tensor.npz` contains daily tensors for IV, log-IV, normalized call/put
+mid prices, normalized half-spreads, SPX close, and log return.
+
+For a quick preprocessing smoke test, use fewer dates:
+
+```bash
+python shared_grid_preprocessing.py \
+  --data-root data/optionmetrics_spx_20000103_20230228 \
+  --output-dir /tmp/shared_grid_smoke \
+  --max-dates 35 \
+  --self-check
 ```
+
+## Step 2: Build Diffusion Windows
+
+The diffusion model expects rolling windows with shape:
+
+```text
+[num_windows, seq_len, channels, maturity_grid, moneyness_grid]
+```
+
+The adapter writes both the training tensor and the conditioning tensor. The
+conditioning tensor currently equals the full data tensor; `train.py` uses
+`--conditioning_length` to keep only the observed prefix fixed during sampling.
+
+### IV-only matched setup
+
+This is the closest diffusion setup to the VolGAN comparison: use 21 observed
+trading days and generate the next trading day.
+
+```bash
+python prepare_shared_grid_data.py \
+  --processed-dir data/processed_shared_grid_11x9 \
+  --output-dir data/shared_grid_iv_22 \
+  --channel-mode iv \
+  --seq-len 22 \
+  --conditioning-length 21 \
+  --self-check
+```
+
+Channels:
+
+```text
+log_iv, log_return_broadcast
+```
+
+The main output file is:
+
+```text
+data/shared_grid_iv_22/shared_grid_30d_logiv_return.npy
+```
+
+### Paper-style call-price setup
+
+This setup includes normalized call prices and uses 29 observed trading days to
+generate day 30.
+
+```bash
+python prepare_shared_grid_data.py \
+  --processed-dir data/processed_shared_grid_11x9 \
+  --output-dir data/shared_grid_call_30 \
+  --channel-mode paper \
+  --seq-len 30 \
+  --conditioning-length 29 \
+  --self-check
+```
+
+Channels:
+
+```text
+log_iv, call_mid_over_s, log_return_broadcast
+```
+
+The main output file is:
+
+```text
+data/shared_grid_call_30/shared_grid_30d_logiv_call_return.npy
+```
+
+## Step 3: Train and Sample Diffusion
+
+Train the IV-only matched setup:
+
+```bash
+python train.py \
+  --data_path data/shared_grid_iv_22/shared_grid_30d_logiv_return.npy \
+  --conditioning_path data/shared_grid_iv_22/shared_grid_30d_conditioning.npy \
+  --conditioning_length 21 \
+  --gpu 0 \
+  --seed 3407
+```
+
+Train the paper-style call-price setup:
+
+```bash
+python train.py \
+  --data_path data/shared_grid_call_30/shared_grid_30d_logiv_call_return.npy \
+  --conditioning_path data/shared_grid_call_30/shared_grid_30d_conditioning.npy \
+  --conditioning_length 29 \
+  --gpu 0 \
+  --seed 3407
+```
+
+`train.py` creates one experiment directory under `model_results/` and one under
+`samples/`. It records the Git commit, CLI arguments, and config snapshot for
+reproducibility.
+
+Typical outputs:
+
+```text
+model_results/dfm_<data_id>_ts<timestamp>_seed<seed>/
+  model-*.pt
+  run_config.json
+  commit_hash.txt
+
+samples/dfm_<data_id>_ts<timestamp>_seed<seed>/
+  sample_batch1.npy
+  sample_batch2.npy
+  ...
+```
+
+The sample tensors keep the first `conditioning_length` days fixed and generate
+the remaining indices. For the one-step experiments above, the generated target
+is index 21 in the IV-only setup and index 29 in the paper-style setup.
+
+For a tiny smoke run:
+
+```bash
+python train.py \
+  --data_path data/shared_grid_iv_22/shared_grid_30d_logiv_return.npy \
+  --conditioning_path data/shared_grid_iv_22/shared_grid_30d_conditioning.npy \
+  --conditioning_length 21 \
+  --num_samples 14 \
+  --epochs 1 \
+  --gpu 0 \
+  --seed 9
+```
+
+## Step 4: Hedging Utilities
+
+`hedging.py` contains the data-driven hedging layer:
+
+- Builds observed OptionMetrics target-straddle and hedge-instrument panels.
+- Solves the transaction-cost LASSO hedge.
+- Supports generator-agnostic scenario adapters:
+  - direct simulated price changes,
+  - selected instrument values,
+  - normalized option price surfaces,
+  - IV surfaces revalued with Black-Scholes.
+- Runs daily backtest mechanics and paper-style summaries.
+
+Run the built-in checks:
+
+```bash
+python hedging.py --solver-self-check
+python hedging.py --scenario-adapter-self-check
+python hedging.py --backtest-self-check
+python hedging.py --paper-output-self-check
+```
+
+Build one observed one-month straddle panel:
+
+```bash
+python hedging.py \
+  --data-dir data/optionmetrics_spx_20000103_20230228 \
+  --start-date 2022-01-21 \
+  --m0 1.0 \
+  --output-dir data/hedging_panel_2022_01_21_m100
+```
+
+The generated model samples still need to be exported into one of the scenario
+formats accepted by `hedging.py`. The most relevant routes are:
+
+- IV-only samples -> `IVSurfaceScenarios`
+- call-price samples -> `NormalizedPriceSurfaceScenarios`
+
+Both routes produce solver-ready arrays:
+
+```text
+target_changes: [num_scenarios]
+hedge_changes:  [num_scenarios, num_hedge_instruments]
+```
+
+These arrays are the inputs to the LASSO hedging solver.
+
+## Reproducible Experiment Checklist
+
+For every experiment, record:
+
+- Git commit hash.
+- Raw data date range.
+- Preprocessing command and output directory.
+- Diffusion window command and output directory.
+- Training command, seed, GPU, and config changes.
+- Model checkpoint directory.
+- Sample directory.
+- Hedging start dates, target moneyness values, and scenario exporter used.
+
+`train.py` records the Git commit and run configuration automatically. The
+preprocessing scripts write metadata files in their output directories.
+
+## Current Status
+
+Implemented and smoke tested:
+
+- raw OptionMetrics to shared 11 x 9 surface preprocessing,
+- IV-only and paper-style diffusion window adapters,
+- conditional diffusion training/sampling path,
+- hedging scenario adapters and LASSO checks,
+- tiny GPU training/sampling smoke tests,
+- tiny real-panel hedging smoke test.
+
+Remaining for full empirical results:
+
+- train production diffusion checkpoints,
+- export `K` legal one-day-ahead scenarios per hedge date,
+- run the full hedging evaluation over the selected test period,
+- compare diffusion against VolGAN using the same data grid and hedging protocol.

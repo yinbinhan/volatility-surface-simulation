@@ -49,7 +49,7 @@ DIM_MULTS_MINIMAL = (1,)           # For very small inputs
 
 # Diffusion parameters
 TIMESTEPS = 200
-SAMPLING_TIMESTEPS = 20   # Number of steps used for DDIM sampling (set >= TIMESTEPS to disable DDIM)
+SAMPLING_TIMESTEPS = 200   # Number of steps used for DDIM sampling (set >= TIMESTEPS to disable DDIM)
 DDIM_ETA = 0.0            # Noise weight for DDIM (0.0 makes sampling deterministic)
 OBJECTIVE = 'pred_x0'
 BETA_SCHEDULE = 'cosine'
@@ -57,13 +57,8 @@ AUTO_NORMALIZE = False
 
 # Training parameters
 BATCH_SIZE = 256
-<<<<<<< HEAD
-LEARNING_RATE = 7e-5
-EPOCHS = 3000
-=======
-LEARNING_RATE = 1e-4
-EPOCHS = 1000
->>>>>>> origin/main
+LEARNING_RATE = 7e-5 # or 1e-4
+EPOCHS = 3000 # or 1000
 WEIGHT_DECAY = 0.01
 USE_COSINE_SCHEDULER = True
 USE_WARM_UP = True
@@ -79,7 +74,7 @@ SAVE_INTERVAL = 100       # Save checkpoint every N epochs
 
 # Sampling parameters
 SAMPLE_BATCHES = 8      # Number of batches to sample
-SAMPLES_PER_BATCH = 128   # Number of samples per batch
+SAMPLES_PER_BATCH = 30   # Number of samples per batch
 SAVE_TIMESTEPS = None     # For sequential sampling, defaults to final output only
 SAMPLE_WINDOW_START = 0   # Default start index for sequential sampling windows
 SAMPLE_WINDOW_LENGTH = None # Number of sequential indices to generate by default (capped by sequence length)

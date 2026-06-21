@@ -1788,7 +1788,7 @@ class Trainer:
                 self.logger.add_scalar('Train/Average Grad Norm', avg_grad_norm, epoch)
                 self.logger.flush()
 
-                self.accelerator.print(
+                tqdm.write(
                     f"Epoch {epoch + 1}/{self.train_epochs} completed with avg loss {avg_train_loss:.4f} "
                     f"and avg grad norm {avg_grad_norm:.4f}"
                 )

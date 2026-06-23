@@ -1,11 +1,10 @@
-"""Evaluate the diffusion hedging backtest into the Cont & Vuletić (2025) tables.
+"""Evaluate hedging backtest outputs into Cont & Vuletic (2025)-style tables.
 
-Consumes the per-observation CSV produced by backtest_diffusion.py and renders
-Table 2 (pooled across m0, Covid-included and Covid-excluded, with paper and
-VolGAN reference rows), Tables 1/3/4, and the figures (pooled and per-m0 Z_t
-histograms, diffusion-vs-baseline scatters, time series, and the alpha/straddle
-diagnostics). VaR follows the paper sign convention as a positive loss
-magnitude: VaR_p = -percentile(Z, p).
+Consumes a per-observation CSV with cumulative tracking errors Z_t and renders
+Table 2 (pooled across m0, Covid-included and Covid-excluded, with paper
+reference rows), Tables 1/3/4 when diagnostic columns exist, and paper-style
+figures. VaR follows the paper sign convention as a positive loss magnitude:
+VaR_p = -percentile(Z, p).
 """
 
 import argparse
@@ -25,11 +24,19 @@ METHOD_COLS = {
     "unhedged": "Z_unhedged",
     "delta": "Z_delta",
     "delta_vega": "Z_delta_vega",
+    "volgan": "Z_volgan",
     "diffusion": "Z_diffusion",
 }
 # Methods shown in the comparison figures (paper compares the three hedges)
-FIG_METHODS = ["delta", "delta_vega", "diffusion"]
-FIG_LABELS = {"delta": "Delta", "delta_vega": "Delta-vega", "diffusion": "Diffusion"}
+FIG_METHODS = ["delta", "delta_vega", "volgan", "diffusion"]
+DATA_DRIVEN_METHODS = ["volgan", "diffusion"]
+FIG_LABELS = {
+    "unhedged": "Unhedged",
+    "delta": "Delta",
+    "delta_vega": "Delta-vega",
+    "volgan": "VolGAN",
+    "diffusion": "Diffusion",
+}
 
 # Paper Table 2 reference (Cont & Vuletić Table 8 — pooled, A2/AIC row).
 # Std, VaR5%, VaR2.5%, VaR1% (mean/median omitted in source for some rows).
@@ -37,14 +44,18 @@ PAPER_REF = {
     "included": {
         "delta":      dict(std=32.70, var_5pct=19.49, var_2_5pct=36.33, var_1pct=58.63),
         "delta_vega": dict(std=29.70, var_5pct=10.90, var_2_5pct=19.70, var_1pct=43.72),
-        "diffusion":  dict(std=32.98, var_5pct=12.79, var_2_5pct=23.42, var_1pct=50.79),
+        "volgan":     dict(std=32.98, var_5pct=12.79, var_2_5pct=23.42, var_1pct=50.79),
     },
     "excluded": {
         "delta":      dict(std=8.40,  var_5pct=13.22, var_2_5pct=22.84, var_1pct=36.66),
         "delta_vega": dict(std=9.34,  var_5pct=9.58,  var_2_5pct=16.67, var_1pct=34.81),
-        "diffusion":  dict(std=8.15,  var_5pct=10.55, var_2_5pct=17.32, var_1pct=33.85),
+        "volgan":     dict(std=8.15,  var_5pct=10.55, var_2_5pct=17.32, var_1pct=33.85),
     },
 }
+
+
+def _available_methods(df: pd.DataFrame, methods) -> list[str]:
+    return [m for m in methods if METHOD_COLS[m] in df.columns]
 
 
 def stats(Z) -> dict:
@@ -78,7 +89,8 @@ def print_table2(df: pd.DataFrame):
                   f"{'VaR5%':>8} {'VaR2.5%':>9} {'VaR1%':>8}")
         print(header)
         print("-" * len(header))
-        for method, col in METHOD_COLS.items():
+        for method in _available_methods(sub, METHOD_COLS):
+            col = METHOD_COLS[method]
             s = stats(sub[col].values)
             print(f"{FIG_LABELS.get(method, method):<22} {'Ours':<8} "
                   f"{s['mean']:>8.2f} {s['median']:>8.2f} {s['std']:>8.2f} "
@@ -92,11 +104,12 @@ def print_table2(df: pd.DataFrame):
 
 def fig6_pooled_hist(df: pd.DataFrame, figdir: Path):
     """Pooled histogram of Z_t per hedge method (log-density)."""
+    methods = _available_methods(df, FIG_METHODS)
     fig, ax = plt.subplots(figsize=(8, 5))
-    lo = min(df[METHOD_COLS[m]].quantile(0.005) for m in FIG_METHODS)
-    hi = max(df[METHOD_COLS[m]].quantile(0.995) for m in FIG_METHODS)
+    lo = min(df[METHOD_COLS[m]].quantile(0.005) for m in methods)
+    hi = max(df[METHOD_COLS[m]].quantile(0.995) for m in methods)
     bins = np.linspace(lo, hi, 120)
-    for m in FIG_METHODS:
+    for m in methods:
         ax.hist(df[METHOD_COLS[m]].values, bins=bins, density=True,
                 histtype="stepfilled", alpha=0.45, label=FIG_LABELS[m])
     ax.set_yscale("log")
@@ -111,24 +124,26 @@ def fig6_pooled_hist(df: pd.DataFrame, figdir: Path):
     print(f"  saved {out}")
 
 
-def _scatter(df: pd.DataFrame, y_method: str, title: str, out: Path):
+def _scatter(df: pd.DataFrame, x_method: str, y_method: str, title: str, out: Path):
     fig, ax = plt.subplots(figsize=(6.5, 6))
     m0_vals = sorted(df["m0"].unique())
     cmap = plt.get_cmap("tab10")
+    x_col = METHOD_COLS[x_method]
+    y_col = METHOD_COLS[y_method]
     for i, m0 in enumerate(m0_vals):
         s = df[df["m0"] == m0]
-        ax.scatter(s["Z_diffusion"], s[METHOD_COLS[y_method]], s=8, alpha=0.5,
+        ax.scatter(s[x_col], s[y_col], s=8, alpha=0.5,
                    color=cmap(i % 10), label=f"$m_0$ = {m0:g}")
     # Robust axis limits (1st/99th pct of both series) so a few outliers don't
     # compress the bulk; the x=y line still spans the visible range.
-    both = np.concatenate([df["Z_diffusion"].values, df[METHOD_COLS[y_method]].values])
+    both = np.concatenate([df[x_col].values, df[y_col].values])
     lo, hi = np.percentile(both, [1, 99])
     pad = 0.05 * (hi - lo)
     lims = [lo - pad, hi + pad]
     ax.plot(lims, lims, "k-", lw=1)
     ax.set_xlim(lims)
     ax.set_ylim(lims)
-    ax.set_xlabel("Tracking error for diffusion hedging (USD)")
+    ax.set_xlabel(f"Tracking error for {FIG_LABELS[x_method].lower()} hedging (USD)")
     ax.set_ylabel(f"Tracking error for {FIG_LABELS[y_method].lower()} hedging (USD)")
     ax.set_title(title)
     ax.legend(fontsize=8)
@@ -139,21 +154,24 @@ def _scatter(df: pd.DataFrame, y_method: str, title: str, out: Path):
 
 
 def figs78(df: pd.DataFrame, figdir: Path):
-    """Scatter diffusion vs delta (Fig 7) and vs delta-vega (Fig 8), Covid excluded.
-    Figs 9/10 = the same with Covid included."""
+    """Scatter data-driven methods vs delta and delta-vega, with/without Covid."""
     ex = df[~_covid_mask(df)]
-    _scatter(ex, "delta", "Figure 7 — diffusion vs delta (Covid excluded)",
-             figdir / "fig7_scatter_delta_excl_covid.png")
-    _scatter(ex, "delta_vega", "Figure 8 — diffusion vs delta-vega (Covid excluded)",
-             figdir / "fig8_scatter_deltavega_excl_covid.png")
-    _scatter(df, "delta", "Figure 9 — diffusion vs delta (Covid included)",
-             figdir / "fig9_scatter_delta_incl_covid.png")
-    _scatter(df, "delta_vega", "Figure 10 — diffusion vs delta-vega (Covid included)",
-             figdir / "fig10_scatter_deltavega_incl_covid.png")
+    for x_method in _available_methods(df, DATA_DRIVEN_METHODS):
+        tag = x_method
+        label = FIG_LABELS[x_method]
+        _scatter(ex, x_method, "delta", f"{label} vs delta (Covid excluded)",
+                 figdir / f"{tag}_scatter_delta_excl_covid.png")
+        _scatter(ex, x_method, "delta_vega", f"{label} vs delta-vega (Covid excluded)",
+                 figdir / f"{tag}_scatter_deltavega_excl_covid.png")
+        _scatter(df, x_method, "delta", f"{label} vs delta (Covid included)",
+                 figdir / f"{tag}_scatter_delta_incl_covid.png")
+        _scatter(df, x_method, "delta_vega", f"{label} vs delta-vega (Covid included)",
+                 figdir / f"{tag}_scatter_deltavega_incl_covid.png")
 
 
 def fig13_per_m0_hist(df: pd.DataFrame, figdir: Path):
-    """Per-m0 histograms of Z_t comparing the three methods (2x3 grid)."""
+    """Per-m0 histograms of Z_t comparing available hedge methods."""
+    methods = _available_methods(df, FIG_METHODS)
     m0_vals = sorted(df["m0"].unique())
     ncol = 3
     nrow = int(np.ceil(len(m0_vals) / ncol))
@@ -161,10 +179,10 @@ def fig13_per_m0_hist(df: pd.DataFrame, figdir: Path):
     for k, m0 in enumerate(m0_vals):
         ax = axes[k // ncol][k % ncol]
         s = df[df["m0"] == m0]
-        lo = min(s[METHOD_COLS[m]].quantile(0.005) for m in FIG_METHODS)
-        hi = max(s[METHOD_COLS[m]].quantile(0.995) for m in FIG_METHODS)
+        lo = min(s[METHOD_COLS[m]].quantile(0.005) for m in methods)
+        hi = max(s[METHOD_COLS[m]].quantile(0.995) for m in methods)
         bins = np.linspace(lo, hi, 80)
-        for m in FIG_METHODS:
+        for m in methods:
             ax.hist(s[METHOD_COLS[m]].values, bins=bins, density=True,
                     histtype="stepfilled", alpha=0.45, label=FIG_LABELS[m])
         ax.set_yscale("log")
@@ -189,16 +207,22 @@ def _panel_grid(m0_vals):
 
 
 def _timeseries(df: pd.DataFrame, figdir: Path, symlog: bool):
-    """Figs 11 (linear) / 12 (symlog): Z_t over time per m0, 3 methods."""
+    """Figs 11 (linear) / 12 (symlog): Z_t over time per m0."""
+    methods = _available_methods(df, FIG_METHODS)
     m0_vals = sorted(df["m0"].unique())
     nrow, ncol = _panel_grid(m0_vals)
     fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.2 * nrow),
                              squeeze=False, sharex=True)
-    colors = {"delta": "tab:blue", "delta_vega": "tab:orange", "diffusion": "tab:green"}
+    colors = {
+        "delta": "tab:blue",
+        "delta_vega": "tab:orange",
+        "volgan": "tab:green",
+        "diffusion": "tab:red",
+    }
     for k, m0 in enumerate(m0_vals):
         ax = axes[k // ncol][k % ncol]
         s = df[df["m0"] == m0].sort_values("date")
-        for m in FIG_METHODS:
+        for m in methods:
             ax.plot(s["date"], s[METHOD_COLS[m]], lw=0.6, color=colors[m], label=FIG_LABELS[m])
         if symlog:
             ax.set_yscale("symlog", linthresh=50)
@@ -357,7 +381,8 @@ def _table2_df(df: pd.DataFrame, covid_included: bool) -> pd.DataFrame:
     sub = df if covid_included else df[~_covid_mask(df)]
     ref_key = "included" if covid_included else "excluded"
     rows = []
-    for method, col in METHOD_COLS.items():
+    for method in _available_methods(sub, METHOD_COLS):
+        col = METHOD_COLS[method]
         s = stats(sub[col].values)
         rows.append({"Method": FIG_LABELS.get(method, method), "Source": "Ours",
                      "N": s["n"], "Mean": s["mean"], "Median": s["median"],
@@ -422,8 +447,8 @@ def main():
     parser.add_argument("--figdir", type=Path, default=Path("results/figures"))
     parser.add_argument("--alpha-dir", type=Path, default=Path("results/alpha_robustness"),
                         help="Dir with obs_alpha_<val>.csv for Fig 14")
-    parser.add_argument("--excel", type=Path, default=Path("results/hedging_tables.xlsx"),
-                        help="Write Tables 1–4 to this .xlsx workbook")
+    parser.add_argument("--excel", type=Path, default=None,
+                        help="Optional .xlsx path for Tables 1–4")
     args = parser.parse_args()
 
     df = pd.read_csv(args.obs, parse_dates=["date"])

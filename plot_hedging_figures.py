@@ -11,6 +11,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+METHOD_LABELS = {
+    "unhedged": "Unhedged",
+    "delta": "Delta",
+    "delta_vega": "Delta-vega",
+    "volgan": "VolGAN",
+    "diffusion": "Diffusion",
+}
+
+MODEL_LABELS = {
+    "volgan": "VolGAN",
+    "diffusion": "Diffusion",
+}
+
+
+def method_label(name: str) -> str:
+    return METHOD_LABELS.get(name, name.replace("_", " ").title())
+
 
 def load_raw(path: Path, method: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -63,16 +80,17 @@ def scatter_pair(
         ax.set_ylim(lo, hi)
     suffix = "" if central_percent is None else f" (central {central_percent:g}%)"
     ax.set_title(f"{title}{suffix}")
-    ax.set_xlabel(f"Tracking error for {x_col} hedging (USD)")
-    ax.set_ylabel(f"Tracking error for {y_col} hedging (USD)")
+    ax.set_xlabel(f"Tracking error for {method_label(x_col)} hedging (USD)")
+    ax.set_ylabel(f"Tracking error for {method_label(y_col)} hedging (USD)")
     ax.grid(True, linewidth=0.4, alpha=0.3)
 
 
-def plot_model(df: pd.DataFrame, method: str, label: str, output_dir: Path) -> None:
+def plot_model(df: pd.DataFrame, method: str, output_dir: Path) -> None:
+    label = MODEL_LABELS.get(method, method_label(method))
     for suffix, central_percent in [("full", None), ("central99", 99.0)]:
         fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
-        scatter_pair(axes[0], df, method, "delta", f"{label} vs delta", central_percent)
-        scatter_pair(axes[1], df, method, "delta_vega", f"{label} vs delta-vega", central_percent)
+        scatter_pair(axes[0], df, method, "delta", f"{label} vs Delta", central_percent)
+        scatter_pair(axes[1], df, method, "delta_vega", f"{label} vs Delta-vega", central_percent)
         out = output_dir / f"{method}_classical_scatter_{suffix}.png"
         fig.savefig(out, dpi=180)
         plt.close(fig)
@@ -83,7 +101,12 @@ def write_stats(frames: list[tuple[str, pd.DataFrame, str]], output_dir: Path) -
     for model_label, df, method in frames:
         for col in ["unhedged", "delta", "delta_vega", method]:
             if col in df.columns:
-                rows.append({"source": model_label, "method": col, **tracking_stats(df[col])})
+                rows.append({
+                    "source": model_label,
+                    "method": col,
+                    "method_label": method_label(col),
+                    **tracking_stats(df[col]),
+                })
     pd.DataFrame(rows).to_csv(output_dir / "tracking_error_stats.csv", index=False)
 
 
@@ -98,11 +121,11 @@ def main() -> None:
     frames: list[tuple[str, pd.DataFrame, str]] = []
     if args.volgan_raw is not None and args.volgan_raw.exists():
         volgan = load_raw(args.volgan_raw, "volgan")
-        plot_model(volgan, "volgan", "VolGAN data-driven", args.output_dir)
+        plot_model(volgan, "volgan", args.output_dir)
         frames.append(("volgan", volgan, "volgan"))
     if args.diffusion_raw is not None and args.diffusion_raw.exists():
         diffusion = load_raw(args.diffusion_raw, "diffusion")
-        plot_model(diffusion, "diffusion", "Diffusion data-driven", args.output_dir)
+        plot_model(diffusion, "diffusion", args.output_dir)
         frames.append(("diffusion", diffusion, "diffusion"))
     if not frames:
         raise ValueError("no existing raw CSVs were provided")

@@ -58,6 +58,8 @@ from hedging import (
 from delta_surface import load_delta_surface, price_contracts as _ds_price, delta_vega_contracts as _ds_greeks
 
 RISK_FREE = 0.0  # paper uses r=0
+UNDERLYING_OPTIONID = "UNDERLYING_SPX"
+UNDERLYING_CP_FLAG = "U"
 
 
 # ─── Market state helpers ─────────────────────────────────────────────────────
@@ -135,6 +137,65 @@ def get_half_spreads(quotes: pd.DataFrame, date: pd.Timestamp, optionids) -> np.
     return np.array(costs)
 
 
+def split_hedge_universe(panel: HedgePanel) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, int]:
+    """Return sorted hedge metadata, option rows, option indices, and underlying index."""
+
+    hedges = panel.hedges.sort_values(["cp_flag", "strike"]).reset_index(drop=True)
+    underlying_mask = (
+        hedges["optionid"].map(lambda value: str(value) == UNDERLYING_OPTIONID)
+        | hedges["cp_flag"].astype(str).eq(UNDERLYING_CP_FLAG)
+        | hedges["role"].astype(str).eq("underlying")
+    )
+    underlying_indices = np.flatnonzero(underlying_mask.to_numpy(dtype=bool))
+    if underlying_indices.size != 1:
+        raise ValueError(f"VolGAN backtest requires exactly one underlying hedge row; found {underlying_indices.size}")
+    option_indices = np.flatnonzero(~underlying_mask.to_numpy(dtype=bool))
+    option_hedges = hedges.iloc[option_indices].reset_index(drop=True)
+    return hedges, option_hedges, option_indices, int(underlying_indices[0])
+
+
+def assemble_total_vector(
+    n_hedges: int,
+    option_indices: np.ndarray,
+    option_values: np.ndarray,
+    underlying_idx: int,
+    spot: float,
+) -> np.ndarray:
+    values = np.empty(n_hedges, dtype=float)
+    values[option_indices] = np.asarray(option_values, dtype=float)
+    values[underlying_idx] = float(spot)
+    return values
+
+
+def assemble_total_scenarios(
+    n_hedges: int,
+    option_indices: np.ndarray,
+    option_changes: np.ndarray,
+    underlying_idx: int,
+    spots_next: np.ndarray,
+    spot_current: float,
+) -> np.ndarray:
+    changes = np.empty((len(spots_next), n_hedges), dtype=float)
+    changes[:, option_indices] = np.asarray(option_changes, dtype=float)
+    changes[:, underlying_idx] = np.asarray(spots_next, dtype=float) - float(spot_current)
+    return changes
+
+
+def assemble_total_greeks(
+    n_hedges: int,
+    option_indices: np.ndarray,
+    option_deltas: np.ndarray,
+    option_vegas: np.ndarray,
+    underlying_idx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    deltas = np.zeros(n_hedges, dtype=float)
+    vegas = np.zeros(n_hedges, dtype=float)
+    deltas[option_indices] = np.asarray(option_deltas, dtype=float)
+    vegas[option_indices] = np.asarray(option_vegas, dtype=float)
+    deltas[underlying_idx] = 1.0
+    return deltas, vegas
+
+
 # ─── Delta baseline ───────────────────────────────────────────────────────────
 
 def straddle_bs_delta(spot, strike, tau, sigma, r=0.0):
@@ -205,14 +266,20 @@ def run_one_window(
     """
     dates, log_iv_rows, closes, log_rets, date_to_idx = state_lookup
     trading_dates = panel.trading_dates
-    # optionids needed only for transaction cost lookups at t0
-    hedge_ids = list(panel.hedges.sort_values(["cp_flag", "strike"])["optionid"])
+    sorted_hedges, option_hedges, option_indices, underlying_idx = split_hedge_universe(panel)
+    hedge_ids = list(sorted_hedges["optionid"])
+    if panel.fixed_atm_optionid is None:
+        return None
+    atm_matches = sorted_hedges["optionid"].map(lambda value: str(value) == str(panel.fixed_atm_optionid)).to_numpy(dtype=bool)
+    if int(atm_matches.sum()) != 1:
+        return None
+    atm_idx = int(np.flatnonzero(atm_matches)[0])
 
     # Contracts as DataFrames (tau will be updated at each step)
     target_contracts = panel.target.sort_values(["cp_flag", "strike"])[
         ["cp_flag", "strike", "ttm"]
     ].rename(columns={"ttm": "tau"}).reset_index(drop=True)
-    hedge_contracts = panel.hedges.sort_values(["cp_flag", "strike"])[
+    hedge_contracts = option_hedges[
         ["cp_flag", "strike", "ttm"]
     ].rename(columns={"ttm": "tau"}).reset_index(drop=True)
 
@@ -234,7 +301,8 @@ def run_one_window(
 
     # NW surface: used only for scenario generation and LASSO g0_scale
     t0_target_prices = bs_price_from_surface(log_iv_t0, spot_t0, tc_t0, r=RISK_FREE)
-    t0_hedge_prices  = bs_price_from_surface(log_iv_t0, spot_t0, hc_t0, r=RISK_FREE)
+    t0_hedge_prices_option = bs_price_from_surface(log_iv_t0, spot_t0, hc_t0, r=RISK_FREE)
+    t0_hedge_prices = assemble_total_vector(len(sorted_hedges), option_indices, t0_hedge_prices_option, underlying_idx, spot_t0)
     V0 = float(t0_target_prices.sum())   # g0_scale for LASSO; NW surface is fine here
 
     # Delta-grid surface: used for all realized P&L tracking
@@ -242,15 +310,11 @@ def run_one_window(
     if t0_day_df is None:
         return None
     t0_target_prices_ds = _ds_price(t0_day_df, spot_t0, tc_t0, r=RISK_FREE)
-    t0_hedge_prices_ds  = _ds_price(t0_day_df, spot_t0, hc_t0, r=RISK_FREE)
+    t0_hedge_prices_ds_option = _ds_price(t0_day_df, spot_t0, hc_t0, r=RISK_FREE)
+    t0_hedge_prices_ds = assemble_total_vector(len(sorted_hedges), option_indices, t0_hedge_prices_ds_option, underlying_idx, spot_t0)
     V0_ds = float(t0_target_prices_ds.sum())
     if V0_ds <= 0:
         return None
-
-    # ATM hedge option index (moneyness closest to 1.0) for delta-vega baseline
-    atm_idx = int(np.argmin(np.abs(
-        panel.hedges.sort_values(["cp_flag", "strike"])["hedge_moneyness"].values - 1.0
-    )))
 
     # ── AIC alpha selection at t=0 ──
     # Transaction costs: use t0 market half-spreads, fall back to 0 for missing optionids
@@ -262,19 +326,21 @@ def run_one_window(
         gen, log_iv_t0, spot_t0, r_tm1_t0, r_tm2_t0, rvol_t0,
         N=n_scenarios, noise_dim=noise_dim, device=device,
     )
-    dV_tr, dH_tr = scenarios_to_solver_arrays(
+    dV_tr, dH_tr_option = scenarios_to_solver_arrays(
         spots_tr, iv_tr, spot_t0, tc_t0, hc_t0,
-        t0_target_prices, t0_hedge_prices, r=RISK_FREE,
+        t0_target_prices, t0_hedge_prices_option, r=RISK_FREE,
     )
+    dH_tr = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_tr_option, underlying_idx, spots_tr, spot_t0)
     # M validation scenarios
     spots_val, iv_val = sample_scenarios(
         gen, log_iv_t0, spot_t0, r_tm1_t0, r_tm2_t0, rvol_t0,
         N=n_val, noise_dim=noise_dim, device=device,
     )
-    dV_val, dH_val = scenarios_to_solver_arrays(
+    dV_val, dH_val_option = scenarios_to_solver_arrays(
         spots_val, iv_val, spot_t0, tc_t0, hc_t0,
-        t0_target_prices, t0_hedge_prices, r=RISK_FREE,
+        t0_target_prices, t0_hedge_prices_option, r=RISK_FREE,
     )
+    dH_val = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_val_option, underlying_idx, spots_val, spot_t0)
 
     alpha_best = select_alpha_aic(
         dV_tr, dH_tr, dV_val, dH_val,
@@ -320,9 +386,11 @@ def run_one_window(
         hc_ds_tp1 = _set_tau(hedge_contracts,  tau_tp1)
 
         prices_target_t   = _ds_price(day_df_t,   spot_t,   tc_ds_t,   r=RISK_FREE)
-        prices_hedge_t    = _ds_price(day_df_t,   spot_t,   hc_ds_t,   r=RISK_FREE)
+        prices_hedge_t_option = _ds_price(day_df_t,   spot_t,   hc_ds_t,   r=RISK_FREE)
         prices_target_tp1 = _ds_price(day_df_tp1, spot_tp1, tc_ds_tp1, r=RISK_FREE)
-        prices_hedge_tp1  = _ds_price(day_df_tp1, spot_tp1, hc_ds_tp1, r=RISK_FREE)
+        prices_hedge_tp1_option = _ds_price(day_df_tp1, spot_tp1, hc_ds_tp1, r=RISK_FREE)
+        prices_hedge_t = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_t_option, underlying_idx, spot_t)
+        prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
 
         V_t   = float(prices_target_t.sum())
         V_tp1 = float(prices_target_tp1.sum())
@@ -338,17 +406,21 @@ def run_one_window(
         tgt_deltas, _ = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
         delta_t = float(tgt_deltas.sum())  # straddle delta = call_delta + put_delta
 
-        trade_cost_delta = 0.0  # no spread cost for underlying (liquid)
-        psi_delta = Pi_delta - phi_delta * spot_t - trade_cost_delta
-        Pi_delta_new = phi_delta * spot_tp1 + psi_delta * (1 + RISK_FREE / 252)
+        phi_delta_new = delta_t
+        trade_cost_delta = 0.0  # zero-cost underlying convention
+        psi_delta = Pi_delta - phi_delta_new * spot_t - trade_cost_delta
+        Pi_delta_new = phi_delta_new * spot_tp1 + psi_delta * (1 + RISK_FREE / 252)
         Z_delta.append(V_tp1 - Pi_delta_new)
         Pi_delta = Pi_delta_new
-        phi_delta = delta_t
+        phi_delta = phi_delta_new
 
         # ── Delta-vega baseline (paper §4.4) ──
         # phi_vega = straddle_vega / ATM_hedge_vega; residual delta via underlying
         tgt_deltas_dv, tgt_vegas_dv = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
-        hdg_deltas_dv, hdg_vegas_dv = _ds_greeks(day_df_t, spot_t, hc_ds_t, r=RISK_FREE)
+        hdg_deltas_option, hdg_vegas_option = _ds_greeks(day_df_t, spot_t, hc_ds_t, r=RISK_FREE)
+        hdg_deltas_dv, hdg_vegas_dv = assemble_total_greeks(
+            len(sorted_hedges), option_indices, hdg_deltas_option, hdg_vegas_option, underlying_idx
+        )
         target_delta_dv = float(tgt_deltas_dv.sum())
         target_vega_dv  = float(tgt_vegas_dv.sum())
         kappa_h = float(hdg_vegas_dv[atm_idx])
@@ -377,16 +449,18 @@ def run_one_window(
 
         # NW-based current prices for scenario diffs (separate from realized P&L)
         prices_target_t_nw = bs_price_from_surface(log_iv_t, spot_t, _set_tau(target_contracts, tau_t), r=RISK_FREE)
-        prices_hedge_t_nw  = bs_price_from_surface(log_iv_t, spot_t, _set_tau(hedge_contracts,  tau_t), r=RISK_FREE)
+        prices_hedge_t_nw_option = bs_price_from_surface(log_iv_t, spot_t, _set_tau(hedge_contracts,  tau_t), r=RISK_FREE)
+        prices_hedge_t_nw = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_t_nw_option, underlying_idx, spot_t)
 
         spots_next, iv_next = sample_scenarios(
             gen, log_iv_t, spot_t, r_tm1_t, r_tm2_t, rvol_t,
             N=n_scenarios, noise_dim=noise_dim, device=device,
         )
-        dV_t, dH_t = scenarios_to_solver_arrays(
+        dV_t, dH_t_option = scenarios_to_solver_arrays(
             spots_next, iv_next, spot_t, tc_nw, hc_nw,
-            prices_target_t_nw, prices_hedge_t_nw, r=RISK_FREE,
+            prices_target_t_nw, prices_hedge_t_nw_option, r=RISK_FREE,
         )
+        dH_t = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_t_option, underlying_idx, spots_next, spot_t)
 
         result = solve_transaction_cost_lasso(
             dV_t, dH_t, phi_volgan, c_t, alpha=alpha_best, g0_scale=V0,

@@ -168,13 +168,30 @@ def get_option_prices(quotes: pd.DataFrame, date: pd.Timestamp, optionids) -> np
     return np.array(prices)
 
 
-def get_half_spreads(quotes: pd.DataFrame, date: pd.Timestamp, optionids) -> np.ndarray:
-    """Look up half bid-ask spreads (transaction costs c_i) for each instrument."""
+def get_half_spreads(
+    quotes: pd.DataFrame,
+    date: pd.Timestamp,
+    optionids,
+    fallback: np.ndarray | None = None,
+) -> np.ndarray:
+    """Look up half bid-ask spreads (transaction costs c_i) for each instrument.
+
+    The paper uses smoothed spread surfaces. This listed-contract approximation
+    only has observed quote spreads; when a current quote spread is unavailable,
+    fall back to the corresponding opening spread rather than silently making the
+    trade free.
+    """
     day = quotes[quotes["date"] == date]
     costs = []
-    for oid in optionids:
+    fallback_arr = None if fallback is None else np.asarray(fallback, dtype=float)
+    for idx, oid in enumerate(optionids):
         row = day[day["optionid"] == oid]
-        costs.append(float(row["half_spread"].iloc[0]) if not row.empty else 0.0)
+        if not row.empty:
+            value = float(row["half_spread"].iloc[0])
+            if np.isfinite(value):
+                costs.append(value)
+                continue
+        costs.append(float(fallback_arr[idx]) if fallback_arr is not None else 0.0)
     return np.array(costs)
 
 
@@ -452,8 +469,10 @@ def run_one_window(
         V_t   = float(prices_target_t.sum())
         V_tp1 = float(prices_target_tp1.sum())
 
-        # Transaction costs fixed at t0 market levels (half bid-ask spread)
-        c_t = c_t0
+        # Transaction costs at the rebalance date. Missing listed spreads fall
+        # back to the t0 spread because this surface-mode backtest may value a
+        # fixed contract on dates without a raw listed quote.
+        c_t = get_half_spreads(panel.quotes, date_t, hedge_ids, fallback=c_t0)
 
         # ── Unhedged ──
         Z_unhedged.append(V_tp1 - V0_ds)
@@ -488,7 +507,7 @@ def run_one_window(
         phi_vega_new   = target_vega_dv / kappa_h
         phi_delta_new  = target_delta_dv - phi_vega_new * delta_h
 
-        trade_cost_dv = float(c_t0[atm_idx] * abs(phi_vega_new - phi_vega_atm))
+        trade_cost_dv = float(c_t[atm_idx] * abs(phi_vega_new - phi_vega_atm))
         # Self-financing: subtract cost of NEW positions at current prices (Convention A,
         # matching LASSO).  Using old positions here would create a phantom gain/loss equal
         # to (phi_new - phi_old) * price_t — the source of the observed blow-up.

@@ -274,6 +274,7 @@ def run_one_window(
         day_df_tp1 = delta_surface_lookup.get(pd.Timestamp(date_tp1))
         if day_df_t is None or day_df_tp1 is None:
             break
+        c_t = get_half_spreads(panel.quotes, date_t, hedge_ids, fallback=c_t0)
 
         tc_ds_t = _set_tau(target_contracts, tau_t)
         hc_ds_t = _set_tau(hedge_contracts, tau_t)
@@ -303,7 +304,7 @@ def run_one_window(
             return None
         phi_vega_new = float(tgt_vegas_dv.sum()) / kappa_h
         phi_delta_under = float(tgt_deltas_dv.sum()) - phi_vega_new * float(hdg_deltas_dv[atm_idx])
-        trade_cost_dv = float(c_t0[atm_idx] * abs(phi_vega_new - phi_vega_atm))
+        trade_cost_dv = float(c_t[atm_idx] * abs(phi_vega_new - phi_vega_atm))
         psi_dv = Pi_dv - phi_vega_new * prices_hedge_t[atm_idx] - phi_delta_under * spot_t - trade_cost_dv
         Pi_dv_new = phi_vega_new * prices_hedge_tp1[atm_idx] + phi_delta_under * spot_tp1 + psi_dv * (1 + RISK_FREE / 252)
         Z_dv.append(V_tp1 - Pi_dv_new)
@@ -322,9 +323,9 @@ def run_one_window(
         spots_next, iv_next = scenarios_t
         dV_t, dH_t_option = scenarios_to_solver_arrays(spots_next, iv_next, spot_t, tc_nw_next, hc_nw_next, prices_target_t_nw, prices_hedge_t_nw_option, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid)
         dH_t = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_t_option, underlying_idx, spots_next, spot_t)
-        result = solve_transaction_cost_lasso(dV_t, dH_t, phi_diffusion, c_t0, alpha=alpha_best, g0_scale=V0)
+        result = solve_transaction_cost_lasso(dV_t, dH_t, phi_diffusion, c_t, alpha=alpha_best, g0_scale=V0)
         phi_new = result.phi
-        trade_cost = float(np.dot(c_t0, np.abs(result.trade)))
+        trade_cost = float(np.dot(c_t, np.abs(result.trade)))
         psi = Pi_diffusion - float(np.dot(phi_new, prices_hedge_t)) - trade_cost
         Pi_diffusion_new = float(np.dot(phi_new, prices_hedge_tp1)) + psi * (1 + RISK_FREE / 252)
         Z_diffusion.append(V_tp1 - Pi_diffusion_new)

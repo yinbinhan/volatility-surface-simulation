@@ -34,33 +34,48 @@ def tracking_stats(values: pd.Series) -> dict[str, float]:
     }
 
 
-def scatter_pair(ax, df: pd.DataFrame, x_col: str, y_col: str, title: str) -> None:
+def scatter_pair(
+    ax,
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    central_percent: float | None = None,
+) -> None:
     x = df[x_col].to_numpy(dtype=float)
     y = df[y_col].to_numpy(dtype=float)
     ax.scatter(x, y, s=9, alpha=0.55, linewidths=0)
     finite = np.isfinite(x) & np.isfinite(y)
     if finite.any():
-        lo = float(min(x[finite].min(), y[finite].min()))
-        hi = float(max(x[finite].max(), y[finite].max()))
+        if central_percent is None:
+            lo = float(min(x[finite].min(), y[finite].min()))
+            hi = float(max(x[finite].max(), y[finite].max()))
+        else:
+            tail = (100.0 - central_percent) / 2.0
+            pooled = np.concatenate([x[finite], y[finite]])
+            lo = float(np.percentile(pooled, tail))
+            hi = float(np.percentile(pooled, 100.0 - tail))
         pad = 0.05 * max(hi - lo, 1.0)
         lo -= pad
         hi += pad
         ax.plot([lo, hi], [lo, hi], color="black", linewidth=1.0)
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
-    ax.set_title(title)
+    suffix = "" if central_percent is None else f" (central {central_percent:g}%)"
+    ax.set_title(f"{title}{suffix}")
     ax.set_xlabel(f"Tracking error for {x_col} hedging (USD)")
     ax.set_ylabel(f"Tracking error for {y_col} hedging (USD)")
     ax.grid(True, linewidth=0.4, alpha=0.3)
 
 
 def plot_model(df: pd.DataFrame, method: str, label: str, output_dir: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
-    scatter_pair(axes[0], df, method, "delta", f"{label} vs delta")
-    scatter_pair(axes[1], df, method, "delta_vega", f"{label} vs delta-vega")
-    out = output_dir / f"{method}_classical_scatter.png"
-    fig.savefig(out, dpi=180)
-    plt.close(fig)
+    for suffix, central_percent in [("full", None), ("central99", 99.0)]:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
+        scatter_pair(axes[0], df, method, "delta", f"{label} vs delta", central_percent)
+        scatter_pair(axes[1], df, method, "delta_vega", f"{label} vs delta-vega", central_percent)
+        out = output_dir / f"{method}_classical_scatter_{suffix}.png"
+        fig.savefig(out, dpi=180)
+        plt.close(fig)
 
 
 def write_stats(frames: list[tuple[str, pd.DataFrame, str]], output_dir: Path) -> None:

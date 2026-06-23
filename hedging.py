@@ -357,13 +357,17 @@ def build_instrument_panel(
     target = select_target_straddle(start_rows, start_spot, expiry, m0=m0)
     target_ids = set(target["optionid"])
     option_hedges = select_hedge_candidates(start_rows, start_spot, expiry, target_ids)
+    target["optionid"] = target["optionid"].map(str)
+    option_hedges["optionid"] = option_hedges["optionid"].map(str)
     fixed_atm_optionid = _select_fixed_atm_optionid(option_hedges, start_spot)
     hedges = _append_underlying_hedge(option_hedges, start_spot, expiry, actual_start)
     selected = pd.concat([target, hedges], ignore_index=True, sort=False)
+    selected["optionid"] = selected["optionid"].map(str)
 
     underlying = load_underlying(data_dir=data_dir, start_date=actual_start, end_date=expiry)
     trading_dates = expected_trading_dates(underlying, actual_start, expiry)
     options = load_raw_options(data_dir=data_dir, start_date=actual_start, end_date=expiry)
+    options["optionid"] = options["optionid"].map(str)
     quotes = options[options["optionid"].isin(selected["optionid"])].copy()
     quotes = quotes.merge(
         selected[["optionid", "role"]].drop_duplicates(),

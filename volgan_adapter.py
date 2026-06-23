@@ -43,12 +43,31 @@ _TAU = "tau"
 
 # ─── Grid ─────────────────────────────────────────────────────────────────────
 
-MONEYNESS_GRID = np.linspace(0.6, 1.4, 10)
-TAU_DAYS = np.array([7, 14, 30, 60, 91, 182, 273, 365])
-TAU_GRID = TAU_DAYS / 365.0
+MONEYNESS_GRID = np.array([0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3, 1.4])
+TAU_GRID = np.array([1 / 365, 1 / 52, 2 / 52, 1 / 12, 1 / 6, 1 / 4, 1 / 2, 3 / 4, 1.0])
+GRID_ORDER = "m_major_tau_minor"
 
 
 # ─── Core math ────────────────────────────────────────────────────────────────
+
+def _flat_to_surface(
+    flat: np.ndarray,
+    m_grid: np.ndarray,
+    tau_grid: np.ndarray,
+    grid_order: str = GRID_ORDER,
+) -> np.ndarray:
+    """Unflatten VolGAN vectors to [N, n_m, n_tau]."""
+    flat = np.asarray(flat, dtype=float)
+    n_m = len(m_grid)
+    n_tau = len(tau_grid)
+    expected = n_m * n_tau
+    if flat.shape[-1] != expected:
+        raise ValueError(f"surface has {flat.shape[-1]} points, expected {expected}")
+    if grid_order == "m_major_tau_minor":
+        return flat.reshape(flat.shape[0], n_m, n_tau)
+    if grid_order == "tau_major_m_minor":
+        return flat.reshape(flat.shape[0], n_tau, n_m).transpose(0, 2, 1)
+    raise ValueError(f"unsupported grid_order={grid_order!r}")
 
 def _bilinear_interp(surfaces: np.ndarray, m_grid: np.ndarray, tau_grid: np.ndarray,
                      m_query: np.ndarray, tau_query: np.ndarray) -> np.ndarray:
@@ -143,14 +162,14 @@ def build_condition(log_iv_flat: np.ndarray, log_ret_tm1: float,
 
     Parameters
     ----------
-    log_iv_flat   : [80] — log of the current IV surface, tau-major flat
+    log_iv_flat   : [n_m * n_tau] — log of the current IV surface
     log_ret_tm1   : raw daily log-return at t-1 (will be annualized internally)
     log_ret_tm2   : raw daily log-return at t-2 (will be annualized internally)
     realised_vol  : 21-day realised vol at t-1 = sqrt(252/21 * sum(r_{t-i}^2))
 
     Returns
     -------
-    [83] — conditioning vector
+    [3 + n_m * n_tau] — conditioning vector
     """
     return np.concatenate([
         [np.sqrt(252) * log_ret_tm1],
@@ -172,6 +191,9 @@ def sample_scenarios(
     N: int = 1000,
     noise_dim: int = 32,
     device: str = "cpu",
+    m_grid: np.ndarray = MONEYNESS_GRID,
+    tau_grid: np.ndarray = TAU_GRID,
+    grid_order: str = GRID_ORDER,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Draw N one-step-ahead scenarios from VolGAN.
@@ -179,7 +201,7 @@ def sample_scenarios(
     Parameters
     ----------
     gen          : trained VolGAN Generator
-    log_iv_flat  : [80] log current IV surface (tau-major)
+    log_iv_flat  : [n_m * n_tau] log current IV surface
     spot         : current SPX spot price
     log_ret_tm1  : raw log-return at t-1
     log_ret_tm2  : raw log-return at t-2
@@ -191,7 +213,7 @@ def sample_scenarios(
     Returns
     -------
     spots_next : [N] — next-day spot prices
-    iv_next    : [N, 10, 8] — next-day IV surfaces (absolute values, not log)
+    iv_next    : [N, n_m, n_tau] — next-day IV surfaces (absolute values, not log)
     """
     cond = build_condition(log_iv_flat, log_ret_tm1, log_ret_tm2, realised_vol)
     cond_t = torch.from_numpy(cond).float().to(device).unsqueeze(0).expand(N, -1)
@@ -199,16 +221,22 @@ def sample_scenarios(
 
     gen.eval()
     with torch.no_grad():
-        fake = gen(noise, cond_t).cpu().numpy()  # [N, 81]
+        fake = gen(noise, cond_t).cpu().numpy()
+
+    surface_points = len(m_grid) * len(tau_grid)
+    if fake.shape[1] != surface_points + 1:
+        raise ValueError(
+            f"VolGAN output dimension {fake.shape[1]} is incompatible with "
+            f"{surface_points} grid points plus one return increment"
+        )
 
     # fake[:,0] is annualized log-return; de-annualize to get daily
     log_ret_next = fake[:, 0] / np.sqrt(252)           # [N]
     spots_next = spot * np.exp(log_ret_next)            # [N]
 
     # IV surface: add increment to current log-IV, then exponentiate
-    log_iv_next_flat = log_iv_flat[None, :] + fake[:, 1:]  # [N, 80]
-    # Unflatten: [N, 80] → [N, 8 (tau), 10 (m)] → [N, 10, 8]
-    iv_next = np.exp(log_iv_next_flat.reshape(N, 8, 10).transpose(0, 2, 1))
+    log_iv_next_flat = log_iv_flat[None, :] + fake[:, 1:]
+    iv_next = np.exp(_flat_to_surface(log_iv_next_flat, m_grid, tau_grid, grid_order))
 
     return spots_next, iv_next
 

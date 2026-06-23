@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 
-# ─── Loader ───────────────────────────────────────────────────────────────────
+# Loader
 
 def load_delta_surface(
     data_dir: Path,
@@ -45,7 +45,7 @@ def load_delta_surface(
     }
 
 
-# ─── Interpolation ────────────────────────────────────────────────────────────
+# Interpolation
 
 def iv_from_delta_surface(
     day_df: pd.DataFrame,
@@ -87,7 +87,7 @@ def iv_from_delta_surface(
     return max((1.0 - w) * iv_lo + w * iv_hi, 1e-6)
 
 
-# ─── Black-Scholes scalars ────────────────────────────────────────────────────
+# Black-Scholes scalars
 
 def _normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -131,7 +131,7 @@ def _bs_vega(
     return spot * sqt * math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
 
 
-# ─── Contract-level pricing ───────────────────────────────────────────────────
+# Contract-level pricing
 
 def price_contracts(
     day_df: pd.DataFrame,

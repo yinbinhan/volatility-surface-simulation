@@ -1,10 +1,8 @@
-"""
-VolGAN → hedging pipeline adapter.
+"""Adapter from a trained VolGAN generator to the hedging pipeline.
 
-Takes a trained VolGAN generator and the current market state, generates N
-one-step-ahead scenarios, and returns SolverScenarioArrays ready for the LASSO solver.
-
-All BS pricing is vectorized over N scenarios via numpy; no Python loops over scenarios.
+Takes the VolGAN generator and the current market state, draws N one-step-ahead
+scenarios, and returns solver-ready arrays for the LASSO solver. Black-Scholes
+pricing is vectorized over the N scenarios.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ import numpy as np
 import torch
 from scipy.stats import norm
 
-# ─── VolGAN import with compatibility shims ───────────────────────────────────
+# VolGAN import with compatibility shims
 sys.path.insert(0, str(Path(__file__).parent.parent / "VolGAN"))
 
 import types as _types, sys as _sys
@@ -41,31 +39,21 @@ _STRIKE = "strike"
 _TAU = "tau"
 
 
-# ─── Grid ─────────────────────────────────────────────────────────────────────
+# Grid
 
 MONEYNESS_GRID = np.linspace(0.6, 1.4, 10)
 TAU_DAYS = np.array([7, 14, 30, 60, 91, 182, 273, 365])
 TAU_GRID = TAU_DAYS / 365.0
 
 
-# ─── Core math ────────────────────────────────────────────────────────────────
+# Core math
 
 def _bilinear_interp(surfaces: np.ndarray, m_grid: np.ndarray, tau_grid: np.ndarray,
                      m_query: np.ndarray, tau_query: np.ndarray) -> np.ndarray:
-    """
-    Bilinear interpolation on a regular (moneyness × tau) grid.
+    """Bilinear interpolation on a regular (moneyness x tau) grid.
 
-    Parameters
-    ----------
-    surfaces  : [N, n_m, n_tau] — one surface per scenario
-    m_grid    : [n_m] sorted moneyness values
-    tau_grid  : [n_tau] sorted tau values
-    m_query   : [N, n_c] — moneyness query per (scenario, contract)
-    tau_query : [n_c]    — tau query per contract (same across scenarios)
-
-    Returns
-    -------
-    [N, n_c] interpolated values
+    surfaces is [N, n_m, n_tau] (one per scenario), m_query is [N, n_c] and
+    tau_query is [n_c] (shared across scenarios). Returns [N, n_c].
     """
     N, n_m, n_tau = surfaces.shape
     n_c = m_query.shape[1]
@@ -73,14 +61,14 @@ def _bilinear_interp(surfaces: np.ndarray, m_grid: np.ndarray, tau_grid: np.ndar
     k_idx = np.arange(N)
 
     for j in range(n_c):
-        # ── tau cell (scalar; same for all scenarios) ──
+        # tau cell (scalar; same for all scenarios)
         tau_j = float(np.clip(tau_query[j], tau_grid[0], tau_grid[-1]))
         t = np.searchsorted(tau_grid, tau_j) - 1
         t = int(np.clip(t, 0, n_tau - 2))
         wt2 = (tau_j - tau_grid[t]) / (tau_grid[t + 1] - tau_grid[t])
         wt1 = 1.0 - wt2
 
-        # ── moneyness cell (vector; varies by scenario) ──
+        # moneyness cell (vector; varies by scenario)
         m_j = np.clip(m_query[:, j], m_grid[0], m_grid[-1])
         m_idx = np.clip(np.searchsorted(m_grid, m_j) - 1, 0, n_m - 2)
         dm = m_grid[m_idx + 1] - m_grid[m_idx]
@@ -99,20 +87,10 @@ def _bilinear_interp(surfaces: np.ndarray, m_grid: np.ndarray, tau_grid: np.ndar
 
 def _bs_price(spots: np.ndarray, strikes: np.ndarray, taus: np.ndarray,
               sigmas: np.ndarray, cp_flags: list[str], r: float = 0.0) -> np.ndarray:
-    """
-    Vectorized Black-Scholes pricing.
+    """Vectorized Black-Scholes pricing.
 
-    Parameters
-    ----------
-    spots   : [N] — spot price per scenario
-    strikes : [n_c] — strike per contract
-    taus    : [n_c] — time to maturity per contract (years)
-    sigmas  : [N, n_c] — implied vol per (scenario, contract)
-    cp_flags: [n_c] — 'C' or 'P'
-
-    Returns
-    -------
-    [N, n_c] option prices
+    spots is [N], strikes/taus/cp_flags are [n_c], sigmas is [N, n_c]. Returns
+    [N, n_c] option prices; cp_flags entries are 'C' or 'P'.
     """
     S = spots[:, None]               # [N, 1]
     K = np.asarray(strikes)[None, :]  # [1, n_c]
@@ -130,27 +108,16 @@ def _bs_price(spots: np.ndarray, strikes: np.ndarray, taus: np.ndarray,
     return np.where(is_call, call_price, put_price)
 
 
-# ─── Conditioning ─────────────────────────────────────────────────────────────
+# Conditioning
 
 def build_condition(log_iv_flat: np.ndarray, log_ret_tm1: float,
                     log_ret_tm2: float, realised_vol: float) -> np.ndarray:
-    """
-    Build the conditioning vector a_t consumed by VolGAN.
+    """Build the conditioning vector a_t consumed by VolGAN.
 
-    DataPreprocesssing() in VolGAN.py constructs:
-        condition = [R_{t-1}*sqrt(252), R_{t-2}*sqrt(252), gamma_{t-1}, log_iv_{t-1}]
-    where gamma is the 21-day realised vol.
-
-    Parameters
-    ----------
-    log_iv_flat   : [80] — log of the current IV surface, tau-major flat
-    log_ret_tm1   : raw daily log-return at t-1 (will be annualized internally)
-    log_ret_tm2   : raw daily log-return at t-2 (will be annualized internally)
-    realised_vol  : 21-day realised vol at t-1 = sqrt(252/21 * sum(r_{t-i}^2))
-
-    Returns
-    -------
-    [83] — conditioning vector
+    Mirrors DataPreprocesssing() in VolGAN.py:
+    [R_{t-1}*sqrt(252), R_{t-2}*sqrt(252), gamma_{t-1}, log_iv_{t-1}], where
+    gamma is the 21-day realised vol and log_iv_flat is [80], tau-major. The two
+    log-returns are raw daily values, annualized here.
     """
     return np.concatenate([
         [np.sqrt(252) * log_ret_tm1],
@@ -160,7 +127,7 @@ def build_condition(log_iv_flat: np.ndarray, log_ret_tm1: float,
     ])
 
 
-# ─── Main sampling function ───────────────────────────────────────────────────
+# Main sampling function
 
 def sample_scenarios(
     gen: _VolGAN.Generator,
@@ -173,25 +140,11 @@ def sample_scenarios(
     noise_dim: int = 32,
     device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Draw N one-step-ahead scenarios from VolGAN.
+    """Draw N one-step-ahead scenarios from VolGAN.
 
-    Parameters
-    ----------
-    gen          : trained VolGAN Generator
-    log_iv_flat  : [80] log current IV surface (tau-major)
-    spot         : current SPX spot price
-    log_ret_tm1  : raw log-return at t-1
-    log_ret_tm2  : raw log-return at t-2
-    realised_vol : annualized 21-day realised vol
-    N            : number of scenarios
-    noise_dim    : generator noise dimension (must match training)
-    device       : "cpu" or "cuda"
-
-    Returns
-    -------
-    spots_next : [N] — next-day spot prices
-    iv_next    : [N, 10, 8] — next-day IV surfaces (absolute values, not log)
+    log_iv_flat is the [80] log current IV surface (tau-major); noise_dim must
+    match training. Returns (spots_next [N], iv_next [N, 10, 8]), where iv_next
+    is absolute IV, not log.
     """
     cond = build_condition(log_iv_flat, log_ret_tm1, log_ret_tm2, realised_vol)
     cond_t = torch.from_numpy(cond).float().to(device).unsqueeze(0).expand(N, -1)
@@ -213,7 +166,7 @@ def sample_scenarios(
     return spots_next, iv_next
 
 
-# ─── Scenario → SolverScenarioArrays ─────────────────────────────────────────
+# Scenario to solver arrays
 
 def scenarios_to_solver_arrays(
     spots_next: np.ndarray,
@@ -227,24 +180,11 @@ def scenarios_to_solver_arrays(
     m_grid: np.ndarray = MONEYNESS_GRID,
     tau_grid: np.ndarray = TAU_GRID,
 ):
-    """
-    Price target and hedge contracts under each scenario, then compute P&L changes.
+    """Price target and hedge contracts under each scenario into solver arrays.
 
-    Parameters
-    ----------
-    spots_next            : [N]
-    iv_next               : [N, 10, 8] — absolute IV surfaces
-    spot_current          : scalar
-    target_contracts      : pd.DataFrame with cp_flag, strike, tau columns
-    hedge_contracts       : pd.DataFrame with cp_flag, strike, tau columns
-    current_target_values : [n_target] current BS/market prices
-    current_hedge_values  : [n_hedge] current BS/market prices
-    r                     : risk-free rate
-
-    Returns
-    -------
-    target_changes : [N]       — scenario P&L of the portfolio
-    hedge_changes  : [N, n_h]  — scenario P&L of each hedging instrument
+    iv_next is [N, 10, 8] absolute IV; target/hedge contracts are DataFrames with
+    cp_flag, strike, tau columns. Returns (target_changes [N], hedge_changes
+    [N, n_h]) as scenario P&L of the portfolio and each hedging instrument.
     """
     N = len(spots_next)
     all_contracts = list(target_contracts.iterrows()) + list(hedge_contracts.iterrows())

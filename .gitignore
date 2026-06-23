@@ -173,27 +173,20 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .jupyter_ystore.db
-<<<<<<< HEAD
-
-/samples
-/model_results
-/data
-/figs
-=======
-model_results/
-samples/
-Evalution_factor.ipynb
-config/config.py
-model_results/
-samples/
-
-*.npy
+# Project data and generated artifacts (large or regenerable)
 /data
 /figs
 /sp500_exp_code
-
-DiT.py
-
 /eval
-
+/samples
+samples/
+model_results/
+scenarios/
+*.npy
+*.pt
+config/config.py
+Evalution_factor.ipynb
+DiT.py
 .DS_Store
+
+# results/ (backtest CSVs + figures) is committed for the handoff: not ignored.

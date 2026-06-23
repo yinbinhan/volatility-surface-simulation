@@ -1,18 +1,8 @@
-"""
-VolGAN hedging backtest for one fixed m0 (ATM straddle by default).
+"""VolGAN hedging backtest for one fixed m0 (ATM straddle by default).
 
-Reproduces the pattern in Table 2 of Cont & Vuletić (2025):
-  Unhedged → Delta → VolGAN LASSO  (monotonically improving tracking error)
-
-Usage:
-  python backtest_volgan.py \\
-      --checkpoint /path/to/volgan_checkpoint.pt \\
-      --prepared-dir data/volgan_prepared \\
-      --data-dir data/VolGAN_optionmetrics_spx_20000103_20230228 \\
-      --m0 1.0 \\
-      --n-scenarios 1000 \\
-      --n-val 100 \\
-      --output results/table2_m1.csv
+Reproduces the Table 2 pattern of Cont & Vuletić (2025) for the unhedged, delta
+and VolGAN-LASSO strategies. Deprecated: VolGAN was the stand-in generator used
+to validate the pipeline; backtest_diffusion.py is the current path.
 """
 
 import argparse
@@ -26,7 +16,7 @@ import pandas as pd
 import torch
 from scipy.stats import norm
 
-# ─── VolGAN adapter shims (must happen before VolGAN import) ──────────────────
+# VolGAN adapter shims (must happen before VolGAN import)
 sys.path.insert(0, str(Path(__file__).parent / "../VolGAN"))
 if "pandas_datareader" not in sys.modules:
     _stub = types.ModuleType("pandas_datareader")
@@ -42,7 +32,7 @@ if not hasattr(_scipy, "arange"):
 
 import VolGAN as _VolGAN
 
-# ─── Local modules ────────────────────────────────────────────────────────────
+# Local modules
 sys.path.insert(0, str(Path(__file__).parent))
 from volgan_adapter import (
     MONEYNESS_GRID, TAU_GRID, sample_scenarios, scenarios_to_solver_arrays,
@@ -59,8 +49,14 @@ from delta_surface import load_delta_surface, price_contracts as _ds_price, delt
 
 RISK_FREE = 0.0  # paper uses r=0
 
+# Delta-vega baseline: minimum hedge-option vega (as a fraction of the straddle
+# vega) for the vega leg to be rebalanced. Cont & Vuletić §4.4 note a low-vega
+# instrument gives an unstable ϕ1; this bounds |ϕ1| ≤ 1/VEGA_FLOOR_FRAC and tames
+# the near-expiry κ_H→0 blow-up of the fixed-K=S0 option (body is unaffected).
+VEGA_FLOOR_FRAC = 0.05  # → |ϕ1| ≤ 20
 
-# ─── Market state helpers ─────────────────────────────────────────────────────
+
+# Market state helpers
 
 def build_state_lookup(prepared_dir: Path):
     """
@@ -108,7 +104,7 @@ def get_day_state(date, date_to_idx, log_iv_rows, closes, log_rets):
     return log_iv_flat, spot, r_tm1, r_tm2, rv
 
 
-# ─── Instrument value helpers ─────────────────────────────────────────────────
+# Instrument value helpers
 
 def get_option_prices(quotes: pd.DataFrame, date: pd.Timestamp, optionids) -> np.ndarray | None:
     """
@@ -135,7 +131,7 @@ def get_half_spreads(quotes: pd.DataFrame, date: pd.Timestamp, optionids) -> np.
     return np.array(costs)
 
 
-# ─── Delta baseline ───────────────────────────────────────────────────────────
+# Delta baseline
 
 def straddle_bs_delta(spot, strike, tau, sigma, r=0.0):
     """
@@ -148,7 +144,7 @@ def straddle_bs_delta(spot, strike, tau, sigma, r=0.0):
     return float(2.0 * norm.cdf(d1) - 1.0)
 
 
-# ─── Contracts with updated tau ───────────────────────────────────────────────
+# Contracts with updated tau
 
 def _set_tau(contracts, tau_val):
     """Return a copy of contracts DataFrame with tau column set to tau_val."""
@@ -179,7 +175,7 @@ def bs_price_from_surface(log_iv_flat: np.ndarray, spot: float,
     return prices[0]  # [n_contracts]
 
 
-# ─── Single window backtest ───────────────────────────────────────────────────
+# Single window backtest
 
 def run_one_window(
     panel: HedgePanel,
@@ -221,7 +217,7 @@ def run_one_window(
     if n_days < 2:
         return None
 
-    # ── t=0: NW surface prices for scenario conditioning and g0_scale ──
+    # t=0: NW surface prices for scenario conditioning and g0_scale
     t0_date = trading_dates[0]
     t0_state = get_day_state(t0_date, date_to_idx, log_iv_rows, closes, log_rets)
     if t0_state is None:
@@ -247,12 +243,16 @@ def run_one_window(
     if V0_ds <= 0:
         return None
 
-    # ATM hedge option index (moneyness closest to 1.0) for delta-vega baseline
-    atm_idx = int(np.argmin(np.abs(
-        panel.hedges.sort_values(["cp_flag", "strike"])["hedge_moneyness"].values - 1.0
-    )))
+    # Paper §4.4: the delta-vega hedge option is fixed at window initiation to the
+    # candidate nearest ATM (K = S0) and HELD to expiry — only the hedge ratio
+    # rebalances daily; the strike does NOT chase spot. Cont & Vuletić explicitly
+    # accept that as this option drifts its vega falls and ϕ1 can become unstable.
+    # (The earlier live-ATM reselection was a deviation that suppressed exactly that
+    # instability, making the delta-vega baseline artificially strong vs the paper.)
+    _hc_strikes = hedge_contracts["strike"].values
+    atm_idx0 = int(np.argmin(np.abs(_hc_strikes / spot_t0 - 1.0)))
 
-    # ── AIC alpha selection at t=0 ──
+    # AIC alpha selection at t=0
     # Transaction costs: use t0 market half-spreads, fall back to 0 for missing optionids
     phi_zero = np.zeros(len(hedge_ids))
     c_t0 = get_half_spreads(panel.quotes, t0_date, hedge_ids)
@@ -281,12 +281,12 @@ def run_one_window(
         phi_prev=phi_zero, c_i=c_t0, g0_scale=V0,
     )
 
-    # ── Rolling loop ──
+    # Rolling loop
     phi_volgan = phi_zero.copy()
     Pi_volgan  = V0_ds   # delta-grid initial value
     phi_delta  = 0.0     # scalar (units of underlying)
     Pi_delta   = V0_ds
-    phi_vega_atm     = 0.0   # position in ATM hedge option (delta-vega)
+    phi_vega_atm     = 0.0   # position in fixed K=S0 hedge option (delta-vega)
     phi_delta_under  = 0.0   # position in underlying (delta-vega residual)
     Pi_dv      = V0_ds
 
@@ -306,7 +306,7 @@ def run_one_window(
         tau_t = max((expiry - date_t).days / 365, 1.0 / 365)
         tau_tp1 = max((expiry - date_tp1).days / 365, 1.0 / 365)
 
-        # ── Realized P&L prices via OptionMetrics delta-grid surface ──
+        # Realized P&L prices via OptionMetrics delta-grid surface
         # Using the delta-grid surface (independent of VolGAN's NW training surface)
         # breaks the circularity that made tracking errors implausibly low.
         day_df_t   = delta_surface_lookup.get(pd.Timestamp(date_t))
@@ -330,39 +330,51 @@ def run_one_window(
         # Transaction costs fixed at t0 market levels (half bid-ask spread)
         c_t = c_t0
 
-        # ── Unhedged ──
+        # Unhedged
         Z_unhedged.append(V_tp1 - V0_ds)
 
-        # ── Delta baseline ──
+        # Delta baseline
         # Greek computation via delta-grid surface at actual straddle moneyness
         tgt_deltas, _ = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
         delta_t = float(tgt_deltas.sum())  # straddle delta = call_delta + put_delta
+        phi_delta = delta_t                # set hedge at t (fixes the off-by-one)
 
         trade_cost_delta = 0.0  # no spread cost for underlying (liquid)
         psi_delta = Pi_delta - phi_delta * spot_t - trade_cost_delta
         Pi_delta_new = phi_delta * spot_tp1 + psi_delta * (1 + RISK_FREE / 252)
         Z_delta.append(V_tp1 - Pi_delta_new)
         Pi_delta = Pi_delta_new
-        phi_delta = delta_t
 
-        # ── Delta-vega baseline (paper §4.4) ──
-        # phi_vega = straddle_vega / ATM_hedge_vega; residual delta via underlying
+        # Delta-vega baseline (paper §4.4)
+        # Hedge with a SINGLE option fixed at window initiation to K≈S0 (atm_idx0)
+        # and held to expiry; only the hedge ratio rebalances each day:
+        #   phi_vega  = kappa_V / kappa_H            (straddle vega / fixed-option vega)
+        #   phi_delta = Delta_V - phi_vega * Delta_H (residual delta via underlying)
+        # This matches Cont & Vuletić §4.4 exactly, including that the fixed option's
+        # vega may drift (so ϕ1 can grow large) rather than being kept ATM each step.
         tgt_deltas_dv, tgt_vegas_dv = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
         hdg_deltas_dv, hdg_vegas_dv = _ds_greeks(day_df_t, spot_t, hc_ds_t, r=RISK_FREE)
         target_delta_dv = float(tgt_deltas_dv.sum())
         target_vega_dv  = float(tgt_vegas_dv.sum())
-        kappa_h = float(hdg_vegas_dv[atm_idx])
-        delta_h = float(hdg_deltas_dv[atm_idx])
+        kappa_h = float(hdg_vegas_dv[atm_idx0])
+        delta_h = float(hdg_deltas_dv[atm_idx0])
 
-        phi_vega_new   = target_vega_dv / kappa_h if abs(kappa_h) > 1e-12 else 0.0
+        # Vega-floor guard (paper §4.4 caveat: low-vega instrument → unstable ϕ1).
+        # Rebalance the vega leg only while the fixed option still carries a usable
+        # vega (≥ VEGA_FLOOR_FRAC of the straddle vega); otherwise carry the prior
+        # ratio. This bounds |ϕ1| ≤ 1/VEGA_FLOOR_FRAC and removes the near-expiry
+        # κ_H→0 detonation while leaving the (paper-matching) body untouched.
+        if abs(kappa_h) > VEGA_FLOOR_FRAC * abs(target_vega_dv) and abs(kappa_h) > 1e-8:
+            phi_vega_new = target_vega_dv / kappa_h
+        else:
+            phi_vega_new = phi_vega_atm   # instrument unusable for vega this step
         phi_delta_new  = target_delta_dv - phi_vega_new * delta_h
 
-        trade_cost_dv = float(c_t0[atm_idx] * abs(phi_vega_new - phi_vega_atm))
-        # Self-financing: subtract cost of NEW positions at current prices (Convention A,
-        # matching LASSO).  Using old positions here would create a phantom gain/loss equal
-        # to (phi_new - phi_old) * price_t — the source of the observed blow-up.
-        psi_dv = Pi_dv - phi_vega_new * prices_hedge_t[atm_idx] - phi_delta_new * spot_t - trade_cost_dv
-        Pi_dv_new = (phi_vega_new   * prices_hedge_tp1[atm_idx]
+        # Same option every day → spread cost is only on the change in its position.
+        trade_cost_dv = float(c_t0[atm_idx0] * abs(phi_vega_new - phi_vega_atm))
+
+        psi_dv = Pi_dv - phi_vega_new * prices_hedge_t[atm_idx0] - phi_delta_new * spot_t - trade_cost_dv
+        Pi_dv_new = (phi_vega_new   * prices_hedge_tp1[atm_idx0]
                      + phi_delta_new * spot_tp1
                      + psi_dv * (1 + RISK_FREE / 252))
         Z_dv.append(V_tp1 - Pi_dv_new)
@@ -370,7 +382,7 @@ def run_one_window(
         phi_vega_atm    = phi_vega_new
         phi_delta_under = phi_delta_new
 
-        # ── VolGAN LASSO ──
+        # VolGAN LASSO
         # Scenarios use NW surface (unchanged); realized P&L uses delta-grid prices above
         tc_nw = _set_tau(target_contracts, tau_tp1)
         hc_nw = _set_tau(hedge_contracts,  tau_tp1)
@@ -407,7 +419,7 @@ def run_one_window(
     return {"unhedged": Z_unhedged, "delta": Z_delta, "delta_vega": Z_dv, "volgan": Z_volgan}
 
 
-# ─── Evaluation ──────────────────────────────────────────────────────────────
+# Evaluation
 
 def tracking_error_stats(Z: np.ndarray) -> dict:
     Z = np.asarray(Z)
@@ -434,7 +446,7 @@ def print_table2(results: dict[str, list[float]]):
         )
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# Entry point
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -461,7 +473,7 @@ def main():
                         help="Exclude Covid-19 window (2020-02-13 to 2020-07-21)")
     args = parser.parse_args()
 
-    # ── Load VolGAN ──
+    # Load VolGAN
     print("Loading checkpoint ...")
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     gen = _VolGAN.Generator(
@@ -473,11 +485,11 @@ def main():
     gen.load_state_dict(ckpt["gen_state"])
     gen.eval()
 
-    # ── Load preprocessed NW surface state ──
+    # Load preprocessed NW surface state
     print("Loading preprocessed surfaces ...")
     state_lookup = build_state_lookup(args.prepared_dir)
 
-    # ── Load OptionMetrics delta-grid surface for realized P&L marking ──
+    # Load OptionMetrics delta-grid surface for realized P&L marking
     test_start = pd.Timestamp(args.test_start)
     test_end   = pd.Timestamp(args.test_end)
     print("Loading OptionMetrics delta-grid surface ...")
@@ -489,17 +501,17 @@ def main():
     print(f"  Loaded {len(delta_surface_lookup)} daily surfaces "
           f"({min(delta_surface_lookup):%Y-%m-%d} to {max(delta_surface_lookup):%Y-%m-%d})")
 
-    # ── Moneyness values to run ──
+    # Moneyness values to run
     # Paper §4 pools m0 ∈ {0.8, 0.85, 0.9, 0.95, 1.0, 1.05}; Table 2: n=1092=52×21
     M0_PAPER = [0.8, 0.85, 0.9, 0.95, 1.0, 1.05]
     m0_values = M0_PAPER if args.all_m0 else [args.m0]
 
-    # ── Monthly window candidates ──
+    # Monthly window candidates
     monthly_starts = pd.date_range(test_start, test_end, freq="MS")
     covid_start = pd.Timestamp("2020-02-13")
     covid_end   = pd.Timestamp("2020-07-21")
 
-    # ── Run backtest ──
+    # Run backtest
     results_all: dict[str, list[float]] = {
         "unhedged": [], "delta": [], "delta_vega": [], "volgan": [],
     }

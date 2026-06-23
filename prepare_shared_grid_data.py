@@ -121,10 +121,11 @@ def build_windows(tensor: np.lib.npyio.NpzFile, seq_len: int, channels: list[str
 
 def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_dates: np.ndarray, args: argparse.Namespace) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
-    data_path = output_dir / f"shared_grid_30d_{channel_slug(args.channels_list)}.npy"
-    conditioning_path = output_dir / "shared_grid_30d_conditioning.npy"
-    dates_path = output_dir / "shared_grid_30d_dates.npy"
-    metadata_path = output_dir / "shared_grid_30d_metadata.json"
+    slug = f"{args.seq_len}d"
+    data_path = output_dir / f"shared_grid_{slug}_{channel_slug(args.channels_list)}.npy"
+    conditioning_path = output_dir / f"shared_grid_{slug}_conditioning.npy"
+    dates_path = output_dir / f"shared_grid_{slug}_dates.npy"
+    metadata_path = output_dir / f"shared_grid_{slug}_metadata.json"
     np.save(data_path, windows)
     np.save(conditioning_path, windows)
     np.save(dates_path, window_dates)
@@ -161,11 +162,12 @@ def write_outputs(output_dir: Path, grid: dict, windows: np.ndarray, window_date
     return metadata
 
 
-def self_check(output_dir: Path, expected_seq_len: int, expected_conditioning_length: int, channels: list[str]) -> None:
-    data = np.load(output_dir / f"shared_grid_30d_{channel_slug(channels)}.npy")
-    cond = np.load(output_dir / "shared_grid_30d_conditioning.npy")
-    dates = np.load(output_dir / "shared_grid_30d_dates.npy", allow_pickle=True)
-    metadata = json.loads((output_dir / "shared_grid_30d_metadata.json").read_text())
+def self_check(output_dir: Path, expected_seq_len: int, expected_conditioning_length: int, channels: list[str], seq_len: int) -> None:
+    slug = f"{seq_len}d"
+    data = np.load(output_dir / f"shared_grid_{slug}_{channel_slug(channels)}.npy")
+    cond = np.load(output_dir / f"shared_grid_{slug}_conditioning.npy")
+    dates = np.load(output_dir / f"shared_grid_{slug}_dates.npy", allow_pickle=True)
+    metadata = json.loads((output_dir / f"shared_grid_{slug}_metadata.json").read_text())
     assert data.shape == cond.shape
     assert data.ndim == 5
     assert data.shape[1] == expected_seq_len
@@ -197,7 +199,7 @@ def main() -> None:
     windows, dates = build_windows(tensor, args.seq_len, args.channels_list)
     metadata = write_outputs(output_dir, grid, windows, dates, args)
     if args.self_check:
-        self_check(output_dir, args.seq_len, args.conditioning_length, args.channels_list)
+        self_check(output_dir, args.seq_len, args.conditioning_length, args.channels_list, seq_len=args.seq_len)
         print("SHARED_GRID_DIFFUSION_DATA_SELF_CHECK=PASS")
     print(json.dumps({"data_path": metadata["data_path"], "conditioning_path": metadata["conditioning_path"], "shape": metadata["shape"]}, sort_keys=True))
 

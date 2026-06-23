@@ -248,6 +248,19 @@ python hedging.py --backtest-self-check
 python hedging.py --paper-output-self-check
 ```
 
+### Paper-compliance review notes
+
+The paper-protocol implementation is concentrated in `hedging.py`:
+
+- `build_instrument_panel(...)` appends one SPX underlying hedge instrument to the option hedge universe, with price `S_t`, delta 1, vega 0, and zero half-spread unless explicitly changed.
+- `benchmark_hedge_positions(...)` implements the paper benchmark supports: `delta` uses only the underlying, while `delta_vega` uses the fixed inception-ATM option plus the underlying. There is no least-squares fallback for either benchmark.
+- `run_daily_backtest(...)` passes the fixed inception ATM option ID into the benchmark calculation on every rebalance date.
+- The scenario adapters partition option contracts from the underlying and use `S_{t+1} - S_t` for the underlying scenario P&L column.
+- Daily tracking-error increments use `target_change - hedge_change + transaction_cost`, matching the sign of `Z_t = V_t - Pi_t` when costs reduce tracking-portfolio wealth.
+- Paper-mode alpha selection uses the fitted training intercept on the validation batch, counts nonzero fitted positions, and reuses one selected alpha across the window.
+
+The decisive benchmark fixture is in `paper_output_self_check()`: for hedges `[underlying, fixed ATM, distractor]` and target delta/vega `(0.3, 0.4)`, it requires `delta = [0.3, 0.0, 0.0]` and `delta_vega = [-0.5, 2.0, 0.0]`.
+
 Build one observed one-month straddle panel:
 
 ```bash

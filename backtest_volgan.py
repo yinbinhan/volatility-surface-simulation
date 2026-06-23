@@ -675,6 +675,7 @@ def main():
     results_all: dict[str, list[float]] = {
         "unhedged": [], "delta": [], "delta_vega": [], "volgan": [],
     }
+    raw_metadata: list[dict[str, object]] = []
     n_windows = 0
 
     for m0 in m0_values:
@@ -711,6 +712,17 @@ def main():
                 results_all[method].extend(window_results[method])
 
             n_days_done = len(window_results["volgan"])
+            interval_starts = panel.trading_dates[:-1][:n_days_done]
+            interval_ends = panel.trading_dates[1:][:n_days_done]
+            for row_in_window, (rebalance_date, interval_end) in enumerate(zip(interval_starts, interval_ends)):
+                raw_metadata.append({
+                    "window_id": n_windows,
+                    "m0": m0,
+                    "window_start": panel.start_date.date().isoformat(),
+                    "rebalance_date": pd.Timestamp(rebalance_date).date().isoformat(),
+                    "interval_end": pd.Timestamp(interval_end).date().isoformat(),
+                    "row_in_window": row_in_window,
+                })
             print(f"OK ({n_days_done} days, "
                   f"Z_volgan std={np.std(window_results['volgan']):.3f})")
             n_windows += 1
@@ -734,6 +746,8 @@ def main():
         raw_lengths = {method: len(Z) for method, Z in results_all.items()}
         if len(set(raw_lengths.values())) == 1:
             raw = pd.DataFrame({method: np.asarray(Z, dtype=float) for method, Z in results_all.items()})
+            if len(raw_metadata) == len(raw):
+                raw = pd.concat([pd.DataFrame(raw_metadata), raw], axis=1)
             raw.insert(0, "observation", np.arange(len(raw)))
             raw_path = args.output.with_name(f"{args.output.stem}_raw{args.output.suffix}")
             raw.to_csv(raw_path, index=False)

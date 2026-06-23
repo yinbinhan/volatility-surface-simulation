@@ -367,6 +367,7 @@ def main() -> None:
     covid_start = pd.Timestamp("2020-02-13")
     covid_end = pd.Timestamp("2020-07-21")
     results_all = {"unhedged": [], "delta": [], "delta_vega": [], "diffusion": []}
+    raw_metadata: list[dict[str, object]] = []
     n_windows = 0
 
     for m0 in m0_values:
@@ -390,7 +391,19 @@ def main() -> None:
                 continue
             for method in results_all:
                 results_all[method].extend(window_results[method])
-            print(f"OK ({len(window_results['diffusion'])} days, Z_diffusion std={np.std(window_results['diffusion']):.3f})")
+            n_days_done = len(window_results["diffusion"])
+            interval_starts = panel.trading_dates[:-1][:n_days_done]
+            interval_ends = panel.trading_dates[1:][:n_days_done]
+            for row_in_window, (rebalance_date, interval_end) in enumerate(zip(interval_starts, interval_ends)):
+                raw_metadata.append({
+                    "window_id": n_windows,
+                    "m0": m0,
+                    "window_start": panel.start_date.date().isoformat(),
+                    "rebalance_date": pd.Timestamp(rebalance_date).date().isoformat(),
+                    "interval_end": pd.Timestamp(interval_end).date().isoformat(),
+                    "row_in_window": row_in_window,
+                })
+            print(f"OK ({n_days_done} days, Z_diffusion std={np.std(window_results['diffusion']):.3f})")
             n_windows += 1
 
     print(f"\nTotal windows: {n_windows}, total observations: {len(results_all['diffusion'])}")
@@ -403,6 +416,8 @@ def main() -> None:
         pd.DataFrame(rows).to_csv(args.output, index=False)
         if len({len(Z) for Z in results_all.values()}) == 1:
             raw = pd.DataFrame({method: np.asarray(Z, dtype=float) for method, Z in results_all.items()})
+            if len(raw_metadata) == len(raw):
+                raw = pd.concat([pd.DataFrame(raw_metadata), raw], axis=1)
             raw.insert(0, "observation", np.arange(len(raw)))
             raw_path = args.output.with_name(f"{args.output.stem}_raw{args.output.suffix}")
             raw.to_csv(raw_path, index=False)

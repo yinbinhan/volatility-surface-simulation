@@ -728,6 +728,15 @@ def main():
             s = tracking_error_stats(Z)
             rows.append({"method": method, **s})
         pd.DataFrame(rows).to_csv(args.output, index=False)
+        raw_lengths = {method: len(Z) for method, Z in results_all.items()}
+        if len(set(raw_lengths.values())) == 1:
+            raw = pd.DataFrame({method: np.asarray(Z, dtype=float) for method, Z in results_all.items()})
+            raw.insert(0, "observation", np.arange(len(raw)))
+            raw_path = args.output.with_name(f"{args.output.stem}_raw{args.output.suffix}")
+            raw.to_csv(raw_path, index=False)
+            print(f"Raw tracking errors saved to {raw_path}")
+        else:
+            print(f"Raw tracking errors not saved because lengths differ: {raw_lengths}")
         print(f"\nResults saved to {args.output}")
 
 

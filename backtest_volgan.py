@@ -65,6 +65,7 @@ build_instrument_panel = _hedging.build_instrument_panel
 select_alpha_aic = _hedging.select_alpha_aic
 solve_transaction_cost_lasso = _hedging.solve_transaction_cost_lasso
 DATA_DIR = _hedging.DATA_DIR
+BENCHMARK_VEGA_FLOOR = _hedging.BENCHMARK_VEGA_FLOOR
 
 RISK_FREE = 0.0  # paper uses r=0
 UNDERLYING_OPTIONID = "UNDERLYING_SPX"
@@ -482,7 +483,9 @@ def run_one_window(
         kappa_h = float(hdg_vegas_dv[atm_idx])
         delta_h = float(hdg_deltas_dv[atm_idx])
 
-        phi_vega_new   = target_vega_dv / kappa_h if abs(kappa_h) > 1e-12 else 0.0
+        if abs(kappa_h) <= BENCHMARK_VEGA_FLOOR:
+            return None
+        phi_vega_new   = target_vega_dv / kappa_h
         phi_delta_new  = target_delta_dv - phi_vega_new * delta_h
 
         trade_cost_dv = float(c_t0[atm_idx] * abs(phi_vega_new - phi_vega_atm))

@@ -30,10 +30,13 @@ from backtest_volgan import (
     solve_transaction_cost_lasso,
     split_hedge_universe,
     tracking_error_stats,
+    _hedging,
     _ds_greeks,
     _ds_price,
     _set_tau,
 )
+
+BENCHMARK_VEGA_FLOOR = _hedging.BENCHMARK_VEGA_FLOOR
 
 
 @dataclass
@@ -296,7 +299,7 @@ def run_one_window(
         hdg_deltas_option, hdg_vegas_option = _ds_greeks(day_df_t, spot_t, hc_ds_t, r=RISK_FREE)
         hdg_deltas_dv, hdg_vegas_dv = assemble_total_greeks(len(sorted_hedges), option_indices, hdg_deltas_option, hdg_vegas_option, underlying_idx)
         kappa_h = float(hdg_vegas_dv[atm_idx])
-        if abs(kappa_h) <= 1e-12:
+        if abs(kappa_h) <= BENCHMARK_VEGA_FLOOR:
             return None
         phi_vega_new = float(tgt_vegas_dv.sum()) / kappa_h
         phi_delta_under = float(tgt_deltas_dv.sum()) - phi_vega_new * float(hdg_deltas_dv[atm_idx])

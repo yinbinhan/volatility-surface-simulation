@@ -662,8 +662,8 @@ def main():
           f"({min(delta_surface_lookup):%Y-%m-%d} to {max(delta_surface_lookup):%Y-%m-%d})")
 
     # ── Moneyness values to run ──
-    # Paper §4 pools m0 ∈ {0.8, 0.85, 0.9, 0.95, 1.0, 1.05}; Table 2: n=1092=52×21
-    M0_PAPER = [0.8, 0.85, 0.9, 0.95, 1.0, 1.05]
+    # Paper Section 4 target straddles use m0 in {0.75, 0.8, 0.9, 1.1, 1.2, 1.25}.
+    M0_PAPER = [0.75, 0.8, 0.9, 1.1, 1.2, 1.25]
     m0_values = M0_PAPER if args.all_m0 else [args.m0]
 
     # ── Monthly window candidates ──

@@ -362,7 +362,7 @@ def main() -> None:
     test_end = pd.Timestamp(args.test_end)
     delta_surface_lookup = load_delta_surface(args.data_dir, start_year=test_start.year - 1, end_year=test_end.year)
 
-    m0_values = [0.8, 0.85, 0.9, 0.95, 1.0, 1.05] if args.all_m0 else [args.m0]
+    m0_values = [0.75, 0.8, 0.9, 1.1, 1.2, 1.25] if args.all_m0 else [args.m0]
     monthly_starts = pd.date_range(test_start, test_end, freq="MS")
     covid_start = pd.Timestamp("2020-02-13")
     covid_end = pd.Timestamp("2020-07-21")

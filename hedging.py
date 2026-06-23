@@ -21,6 +21,9 @@ import pandas as pd
 
 DATA_DIR = Path("data/optionmetrics_spx_20000103_20230228")
 HEDGE_MONEYNESS = (0.9, 0.95, 0.975, 1.0, 1.025, 1.05, 1.1)
+UNDERLYING_OPTIONID = "UNDERLYING_SPX"
+UNDERLYING_CP_FLAG = "U"
+UNDERLYING_HALF_SPREAD = 0.0
 RAW_OPTION_COLUMNS = [
     "date",
     "exdate",
@@ -57,6 +60,7 @@ class HedgePanel:
     quotes: pd.DataFrame
     missing_quotes: pd.DataFrame
     trading_dates: pd.DatetimeIndex
+    fixed_atm_optionid: object | None = None
 
 
 def _as_timestamp(value: str | pd.Timestamp) -> pd.Timestamp:
@@ -199,6 +203,93 @@ def select_hedge_candidates(
     return hedges.drop_duplicates("optionid").reset_index(drop=True)
 
 
+def _underlying_metadata_row(start_spot: float, expiry: pd.Timestamp, actual_start: pd.Timestamp) -> dict[str, object]:
+    return {
+        "role": "underlying",
+        "optionid": UNDERLYING_OPTIONID,
+        "cp_flag": UNDERLYING_CP_FLAG,
+        "strike": float(start_spot),
+        "strike_price": float(start_spot),
+        "spot": float(start_spot),
+        "moneyness": 1.0,
+        "mid_price": float(start_spot),
+        "half_spread": UNDERLYING_HALF_SPREAD,
+        "bid_ask_spread": 2.0 * UNDERLYING_HALF_SPREAD,
+        "delta": 1.0,
+        "vega": 0.0,
+        "impl_volatility": np.nan,
+        "days_to_exp": int(max((expiry - actual_start).days, 0)),
+        "ttm": max((expiry - actual_start).days, 0) / 365.0,
+        "exdate": expiry,
+        "date": actual_start,
+        "hedge_moneyness": 1.0,
+        "volume": np.nan,
+        "open_interest": np.nan,
+        "symbol": UNDERLYING_OPTIONID,
+    }
+
+
+def _append_underlying_hedge(
+    option_hedges: pd.DataFrame, start_spot: float, expiry: pd.Timestamp, actual_start: pd.Timestamp
+) -> pd.DataFrame:
+    underlying_row = pd.DataFrame([_underlying_metadata_row(start_spot, expiry, actual_start)])
+    return pd.concat([option_hedges, underlying_row], ignore_index=True, sort=False)
+
+
+def _underlying_quote_rows(underlying: pd.DataFrame, expiry: pd.Timestamp) -> pd.DataFrame:
+    rows = []
+    for row in underlying.itertuples(index=False):
+        date = _as_timestamp(row.date)
+        spot = float(row.close)
+        rows.append(
+            {
+                "date": date,
+                "exdate": expiry,
+                "optionid": UNDERLYING_OPTIONID,
+                "role": "underlying",
+                "cp_flag": UNDERLYING_CP_FLAG,
+                "strike": spot,
+                "strike_price": spot,
+                "spot": spot,
+                "moneyness": 1.0,
+                "mid_price": spot,
+                "half_spread": UNDERLYING_HALF_SPREAD,
+                "bid_ask_spread": 2.0 * UNDERLYING_HALF_SPREAD,
+                "delta": 1.0,
+                "vega": 0.0,
+                "impl_volatility": np.nan,
+                "days_to_exp": int(max((expiry - date).days, 0)),
+                "ttm": max((expiry - date).days, 0) / 365.0,
+                "volume": np.nan,
+                "open_interest": np.nan,
+                "symbol": UNDERLYING_OPTIONID,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _is_underlying_frame(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series([], dtype=bool, index=frame.index)
+    mask = pd.Series(False, index=frame.index)
+    if "optionid" in frame.columns:
+        mask = mask | frame["optionid"].map(lambda value: str(value) == UNDERLYING_OPTIONID)
+    if "cp_flag" in frame.columns:
+        mask = mask | frame["cp_flag"].astype(str).eq(UNDERLYING_CP_FLAG)
+    if "role" in frame.columns:
+        mask = mask | frame["role"].astype(str).eq("underlying")
+    return mask
+
+
+def _select_fixed_atm_optionid(hedges: pd.DataFrame, start_spot: float) -> object | None:
+    option_hedges = hedges.loc[~_is_underlying_frame(hedges)].copy()
+    if option_hedges.empty:
+        return None
+    option_hedges["_atm_distance"] = (pd.to_numeric(option_hedges["strike"], errors="coerce") - float(start_spot)).abs()
+    option_hedges = option_hedges.sort_values(["_atm_distance", "strike", "optionid"])
+    return option_hedges.iloc[0]["optionid"]
+
+
 def expected_trading_dates(
     underlying: pd.DataFrame, start_date: pd.Timestamp, expiry_date: pd.Timestamp
 ) -> pd.DatetimeIndex:
@@ -265,7 +356,9 @@ def build_instrument_panel(
     expiry = choose_expiry(start_rows, target_days=target_days)
     target = select_target_straddle(start_rows, start_spot, expiry, m0=m0)
     target_ids = set(target["optionid"])
-    hedges = select_hedge_candidates(start_rows, start_spot, expiry, target_ids)
+    option_hedges = select_hedge_candidates(start_rows, start_spot, expiry, target_ids)
+    fixed_atm_optionid = _select_fixed_atm_optionid(option_hedges, start_spot)
+    hedges = _append_underlying_hedge(option_hedges, start_spot, expiry, actual_start)
     selected = pd.concat([target, hedges], ignore_index=True, sort=False)
 
     underlying = load_underlying(data_dir=data_dir, start_date=actual_start, end_date=expiry)
@@ -278,6 +371,8 @@ def build_instrument_panel(
         how="left",
         validate="many_to_one",
     )
+    underlying_quotes = _underlying_quote_rows(underlying, expiry)
+    quotes = pd.concat([quotes, underlying_quotes], ignore_index=True, sort=False)
     quotes = quotes.sort_values(["date", "role", "cp_flag", "strike"]).reset_index(drop=True)
     missing = quote_coverage(quotes, selected, trading_dates)
 
@@ -290,6 +385,7 @@ def build_instrument_panel(
         quotes=quotes,
         missing_quotes=missing,
         trading_dates=trading_dates,
+        fixed_atm_optionid=fixed_atm_optionid,
     )
 
 
@@ -318,6 +414,10 @@ def panel_self_check(panel: HedgePanel) -> list[str]:
         violations.append("target straddle call and put must share one strike")
     if panel.hedges.empty:
         violations.append("hedge candidate set is empty")
+    if _is_underlying_frame(panel.hedges).sum() != 1:
+        violations.append("hedge candidate set must contain exactly one underlying row")
+    if panel.fixed_atm_optionid is None:
+        violations.append("fixed inception ATM benchmark option id is missing")
     if set(panel.target["optionid"]).intersection(set(panel.hedges["optionid"])):
         violations.append("target option IDs appear in hedge candidates")
     if panel.quotes.empty:
@@ -570,16 +670,46 @@ def _validate_surface_contract_counts(target_contracts, hedge_contracts, current
     return current_target, current_hedge
 
 
+def _partition_hedge_contracts_for_surface(hedge_contracts: pd.DataFrame, cp_col: str, strike_col: str, tau_col: str):
+    hedge_contracts = pd.DataFrame(hedge_contracts).reset_index(drop=True)
+    underlying_mask = _is_underlying_frame(hedge_contracts)
+    underlying_indices = np.flatnonzero(underlying_mask.to_numpy(dtype=bool))
+    if underlying_indices.size > 1:
+        raise ValueError("surface scenario adapters support at most one underlying hedge row")
+    option_indices = np.flatnonzero(~underlying_mask.to_numpy(dtype=bool))
+    option_contracts_raw = hedge_contracts.iloc[option_indices].reset_index(drop=True)
+    option_contracts = _validate_contracts(option_contracts_raw, "hedge_contracts", cp_col, strike_col, tau_col)
+    return hedge_contracts, option_contracts, option_indices, underlying_indices
+
+
+def _assemble_hedge_next_values(
+    hedge_count: int,
+    option_indices: np.ndarray,
+    option_next_values: np.ndarray,
+    underlying_indices: np.ndarray,
+    spots: np.ndarray,
+) -> np.ndarray:
+    next_hedge = np.empty((len(spots), hedge_count), dtype=float)
+    if len(option_indices):
+        next_hedge[:, option_indices] = option_next_values
+    if len(underlying_indices):
+        next_hedge[:, int(underlying_indices[0])] = spots
+    return next_hedge
+
+
 def adapt_normalized_price_surface(scenarios: NormalizedPriceSurfaceScenarios) -> SolverScenarioArrays:
     """Revalue selected contracts from normalized price surfaces."""
 
     target_contracts = _validate_contracts(scenarios.target_contracts, "target_contracts", scenarios.cp_col, scenarios.strike_col, scenarios.tau_col)
-    hedge_contracts = _validate_contracts(scenarios.hedge_contracts, "hedge_contracts", scenarios.cp_col, scenarios.strike_col, scenarios.tau_col)
+    hedge_contracts, hedge_option_contracts, option_indices, underlying_indices = _partition_hedge_contracts_for_surface(
+        scenarios.hedge_contracts, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col
+    )
     current_target, current_hedge = _validate_surface_contract_counts(target_contracts, hedge_contracts, scenarios.current_target_values, scenarios.current_hedge_values)
     _require_columns(scenarios.normalized_surface, [scenarios.scenario_col, scenarios.cp_col, scenarios.moneyness_col, scenarios.tau_col, scenarios.normalized_price_col], "normalized_surface")
     scenario_ids, spots = _scenario_ids_and_spots(scenarios.normalized_surface, scenarios.scenario_col, scenarios.spot_next)
     next_target = _revalue_normalized_surface(target_contracts, scenarios.normalized_surface, scenario_ids, spots, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col, scenarios.scenario_col, scenarios.moneyness_col, scenarios.normalized_price_col)
-    next_hedge = _revalue_normalized_surface(hedge_contracts, scenarios.normalized_surface, scenario_ids, spots, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col, scenarios.scenario_col, scenarios.moneyness_col, scenarios.normalized_price_col)
+    option_next = _revalue_normalized_surface(hedge_option_contracts, scenarios.normalized_surface, scenario_ids, spots, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col, scenarios.scenario_col, scenarios.moneyness_col, scenarios.normalized_price_col)
+    next_hedge = _assemble_hedge_next_values(len(hedge_contracts), option_indices, option_next, underlying_indices, spots)
     return adapt_selected_instrument_values(SelectedInstrumentValueScenarios(current_target, current_hedge, next_target, next_hedge))
 
 
@@ -587,12 +717,15 @@ def adapt_iv_surface(scenarios: IVSurfaceScenarios) -> SolverScenarioArrays:
     """Revalue selected contracts from IV surfaces with Black-Scholes."""
 
     target_contracts = _validate_contracts(scenarios.target_contracts, "target_contracts", scenarios.cp_col, scenarios.strike_col, scenarios.tau_col)
-    hedge_contracts = _validate_contracts(scenarios.hedge_contracts, "hedge_contracts", scenarios.cp_col, scenarios.strike_col, scenarios.tau_col)
+    hedge_contracts, hedge_option_contracts, option_indices, underlying_indices = _partition_hedge_contracts_for_surface(
+        scenarios.hedge_contracts, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col
+    )
     current_target, current_hedge = _validate_surface_contract_counts(target_contracts, hedge_contracts, scenarios.current_target_values, scenarios.current_hedge_values)
     _require_columns(scenarios.iv_surface, [scenarios.scenario_col, scenarios.cp_col, scenarios.moneyness_col, scenarios.tau_col, scenarios.iv_col], "iv_surface")
     scenario_ids, spots = _scenario_ids_and_spots(scenarios.iv_surface, scenarios.scenario_col, scenarios.spot_next)
     next_target = _revalue_iv_surface(target_contracts, scenarios.iv_surface, scenario_ids, spots, scenarios.risk_free_rate, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col, scenarios.scenario_col, scenarios.moneyness_col, scenarios.iv_col)
-    next_hedge = _revalue_iv_surface(hedge_contracts, scenarios.iv_surface, scenario_ids, spots, scenarios.risk_free_rate, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col, scenarios.scenario_col, scenarios.moneyness_col, scenarios.iv_col)
+    option_next = _revalue_iv_surface(hedge_option_contracts, scenarios.iv_surface, scenario_ids, spots, scenarios.risk_free_rate, scenarios.cp_col, scenarios.strike_col, scenarios.tau_col, scenarios.scenario_col, scenarios.moneyness_col, scenarios.iv_col)
+    next_hedge = _assemble_hedge_next_values(len(hedge_contracts), option_indices, option_next, underlying_indices, spots)
     return adapt_selected_instrument_values(SelectedInstrumentValueScenarios(current_target, current_hedge, next_target, next_hedge))
 
 
@@ -635,7 +768,15 @@ def scenario_adapter_self_check() -> list[str]:
         failures.append("selected-instrument hedge values produced wrong changes")
 
     target_contracts = pd.DataFrame({"optionid": [101, 102], "cp_flag": ["C", "P"], "strike": [100.0, 100.0], "tau": [0.08, 0.08]})
-    hedge_contracts = pd.DataFrame({"optionid": [201, 202], "cp_flag": ["C", "P"], "strike": [95.0, 105.0], "tau": [0.08, 0.08]})
+    hedge_contracts = pd.DataFrame(
+        {
+            "optionid": [201, 202, UNDERLYING_OPTIONID],
+            "role": ["hedge", "hedge", "underlying"],
+            "cp_flag": ["C", "P", UNDERLYING_CP_FLAG],
+            "strike": [95.0, 105.0, 100.0],
+            "tau": [0.08, 0.08, np.nan],
+        }
+    )
     rows = []
     for scenario_id, shift in [(0, 0.0), (1, 0.01)]:
         for cp_flag in ["C", "P"]:
@@ -643,27 +784,39 @@ def scenario_adapter_self_check() -> list[str]:
                 base = 0.10 if cp_flag == "C" else 0.06
                 rows.append({"scenario_id": scenario_id, "cp_flag": cp_flag, "moneyness": moneyness, "tau": 0.08, "normalized_price": base + shift + 0.2 * abs(moneyness - 1.0), "implied_volatility": 0.20 + shift})
     surface = pd.DataFrame(rows)
-    normalized = adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.zeros(2), surface, np.array([100.0, 100.0])))
-    if normalized.target_changes.shape != (2,) or normalized.hedge_changes.shape != (2, 2):
+    normalized = adapt_scenarios_to_solver(
+        NormalizedPriceSurfaceScenarios(
+            target_contracts, hedge_contracts, np.zeros(2), np.array([0.0, 0.0, 100.0]), surface, np.array([100.0, 100.0])
+        )
+    )
+    if normalized.target_changes.shape != (2,) or normalized.hedge_changes.shape != (2, 3):
         failures.append("normalized surface revaluation returned wrong solver array shapes")
     if not np.all(np.isfinite(normalized.target_changes)) or not np.all(np.isfinite(normalized.hedge_changes)):
         failures.append("normalized surface revaluation returned non-finite arrays")
-    if not np.allclose(normalized.hedge_changes[0], np.array([11.0, 7.0])):
+    if not np.allclose(normalized.hedge_changes[0], np.array([11.0, 7.0, 0.0])):
         failures.append("hedge contract rows did not align with hedge matrix columns")
+    if not np.allclose(normalized.hedge_changes[:, 2], np.array([0.0, 0.0])):
+        failures.append("normalized surface underlying column did not equal spot changes")
 
-    iv = adapt_scenarios_to_solver(IVSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.zeros(2), surface, np.array([100.0, 101.0]), risk_free_rate=0.0))
-    if iv.target_changes.shape != (2,) or iv.hedge_changes.shape != (2, 2):
+    iv = adapt_scenarios_to_solver(
+        IVSurfaceScenarios(
+            target_contracts, hedge_contracts, np.zeros(2), np.array([0.0, 0.0, 100.0]), surface, np.array([100.0, 101.0]), risk_free_rate=0.0
+        )
+    )
+    if iv.target_changes.shape != (2,) or iv.hedge_changes.shape != (2, 3):
         failures.append("IV surface revaluation returned wrong solver array shapes")
     if not np.all(np.isfinite(iv.target_changes)) or not np.all(np.isfinite(iv.hedge_changes)):
         failures.append("IV surface revaluation returned non-finite arrays")
+    if not np.allclose(iv.hedge_changes[:, 2], np.array([0.0, 1.0])):
+        failures.append("IV surface underlying column did not equal spot changes")
 
     expect_failure("invalid direct shape", lambda: adapt_scenarios_to_solver(DirectScenarioChanges(np.ones(2), np.ones((3, 1)))))
-    expect_failure("missing spot", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.zeros(2), surface, pd.Series({0: 100.0}))))
+    expect_failure("missing spot", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.array([0.0, 0.0, 100.0]), surface, pd.Series({0: 100.0}))))
     bad_tau_contracts = target_contracts.copy()
     bad_tau_contracts.loc[0, "tau"] = 0.0
-    expect_failure("nonpositive tau", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(bad_tau_contracts, hedge_contracts, np.zeros(2), np.zeros(2), surface, np.array([100.0, 100.0]))))
+    expect_failure("nonpositive tau", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(bad_tau_contracts, hedge_contracts, np.zeros(2), np.array([0.0, 0.0, 100.0]), surface, np.array([100.0, 100.0]))))
     call_only_surface = surface[surface["cp_flag"] == "C"].copy()
-    expect_failure("missing put/call route", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.zeros(2), call_only_surface, np.array([100.0, 100.0]))))
+    expect_failure("missing put/call route", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.array([0.0, 0.0, 100.0]), call_only_surface, np.array([100.0, 100.0]))))
     expect_failure("column/instrument mismatch", lambda: adapt_scenarios_to_solver(NormalizedPriceSurfaceScenarios(target_contracts, hedge_contracts, np.zeros(2), np.zeros(1), surface, np.array([100.0, 100.0]))))
 
     return failures
@@ -911,10 +1064,11 @@ def select_alpha_aic(
 ):
     """Select alpha by validation AIC over independent validation scenarios.
 
-    Paper §4.2 eq.(24): AIC(alpha) = M*log(RSS/M) + 2*(1 + active_instruments)
-    where RSS is computed on M independent validation scenarios using A_t
-    re-estimated on the validation set given phi fitted on training scenarios.
-    The +1 counts the unpenalized intercept A_t as a free parameter.
+    Paper §4.2 eq.(24): AIC(alpha) = M*log(RSS/M) + 2*(1 + active_instruments).
+    RSS is computed on M independent validation scenarios using the A_t and
+    phi_t fitted on the training scenarios. The validation intercept is not
+    re-estimated. The +1 counts the unpenalized intercept A_t as a free
+    parameter, and active_instruments counts nonzero fitted positions.
     """
 
     if alpha_grid is None:
@@ -950,18 +1104,16 @@ def select_alpha_aic(
             max_iter=max_iter,
             tol=tol,
         )
-        # Re-estimate A_t on validation set given fitted phi (paper eq.24).
-        val_intercept = float(np.mean(y_val - x_val @ result.phi))
-        validation_residual = y_val - val_intercept - x_val @ result.phi
+        validation_residual = y_val - result.intercept - x_val @ result.phi
         validation_mse = float(np.mean(validation_residual * validation_residual))
-        active_trades = int(np.count_nonzero(np.abs(result.trade) > 1e-8))
+        active_positions = int(np.count_nonzero(np.abs(result.phi) > 1e-8))
         # +1 counts the unpenalized intercept A_t (paper eq.24).
-        aic = m_val * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * (1 + active_trades)
+        aic = m_val * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * (1 + active_positions)
         row = {
             "alpha": float(alpha),
             "aic": float(aic),
             "validation_mse": validation_mse,
-            "active_trades": active_trades,
+            "active_positions": active_positions,
             "result": result,
         }
         rows.append(row)
@@ -1066,18 +1218,18 @@ def solver_self_check() -> list[str]:
             float(alpha),
             g0_scale=1.0,
         )
-        val_intercept = float(np.mean(validation_y - validation_x @ result.phi))
-        validation_residual = validation_y - val_intercept - validation_x @ result.phi
+        validation_residual = validation_y - result.intercept - validation_x @ result.phi
         validation_mse = float(np.mean(validation_residual * validation_residual))
-        active_trades = int(np.count_nonzero(np.abs(result.trade) > 1e-8))
+        active_positions = int(np.count_nonzero(np.abs(result.phi) > 1e-8))
         m = validation_y.shape[0]
-        aic = m * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * (1 + active_trades)
+        aic = m * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * (1 + active_positions)
         manual_rows.append(
             {
                 "alpha": float(alpha),
                 "aic": float(aic),
                 "validation_mse": validation_mse,
-                "active_trades": active_trades,
+                "active_positions": active_positions,
+                "intercept": result.intercept,
             }
         )
     expected_alpha = min(manual_rows, key=lambda row: (row["aic"], row["alpha"]))["alpha"]
@@ -1190,16 +1342,33 @@ def _complete_interval_quotes(
     return current_target, current_hedges, next_target, next_hedges, missing
 
 
-def _least_norm_exposure_match(exposures: np.ndarray, target_exposure: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(exposures, dtype=float)
-    target = np.asarray(target_exposure, dtype=float)
-    if matrix.ndim != 2 or target.ndim != 1:
-        raise ValueError('benchmark exposure solve requires two-dimensional exposures and one-dimensional target')
-    if matrix.shape[0] != target.shape[0]:
-        raise ValueError('benchmark exposure rows must match target exposure length')
-    if not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(target)):
-        raise ValueError('benchmark exposures must be finite')
-    return np.linalg.lstsq(matrix, target, rcond=None)[0]
+def _optionid_equals(value: object, expected: object) -> bool:
+    if value == expected:
+        return True
+    if str(value) == str(expected):
+        return True
+    try:
+        return float(value) == float(expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def _single_underlying_index(current_hedges: pd.DataFrame) -> int:
+    indices = np.flatnonzero(_is_underlying_frame(current_hedges).to_numpy(dtype=bool))
+    if indices.size != 1:
+        raise ValueError(f"paper benchmark requires exactly one underlying hedge row; found {indices.size}")
+    return int(indices[0])
+
+
+def _single_atm_index(current_hedges: pd.DataFrame, atm_optionid: object) -> int:
+    if atm_optionid is None:
+        raise ValueError("paper delta-vega benchmark requires a fixed inception-ATM option id")
+    matches = current_hedges["optionid"].map(lambda value: _optionid_equals(value, atm_optionid)).to_numpy(dtype=bool)
+    matches = matches & (~_is_underlying_frame(current_hedges).to_numpy(dtype=bool))
+    indices = np.flatnonzero(matches)
+    if indices.size != 1:
+        raise ValueError(f"fixed inception-ATM option {atm_optionid!r} not found exactly once in current hedges")
+    return int(indices[0])
 
 
 def benchmark_hedge_positions(
@@ -1207,54 +1376,40 @@ def benchmark_hedge_positions(
     current_hedges: pd.DataFrame,
     atm_optionid: object = None,
 ) -> BenchmarkHedgePositions:
-    """Return Greek-matching benchmark positions.
+    """Return paper benchmark positions.
 
-    delta: min-norm positions matching target delta across all hedge instruments.
-
-    delta_vega: paper §4.4 formula when atm_optionid is provided (preferred):
-      phi_vega = kappa_V / kappa_H  (portfolio vega / ATM option vega)
-      phi_delta = Delta_V - phi_vega * Delta_H  (residual delta via underlying)
-    The ATM option slot in the position vector gets phi_vega; all other slots
-    are zero except the underlying slot (if present) which gets phi_delta.
-    Falls back to min-norm lstsq across all instruments when atm_optionid is
-    None (legacy behaviour retained for backward compatibility).
+    Delta uses only the underlying. Delta-vega uses only the fixed
+    inception-ATM option and the underlying. No least-squares fallback is
+    allowed for strategies carrying the paper benchmark names.
     """
 
     target_delta = float(pd.to_numeric(current_target['delta'], errors='coerce').sum())
     target_vega = float(pd.to_numeric(current_target['vega'], errors='coerce').sum())
     hedge_delta = pd.to_numeric(current_hedges['delta'], errors='coerce').to_numpy(dtype=float)
     hedge_vega = pd.to_numeric(current_hedges['vega'], errors='coerce').to_numpy(dtype=float)
-    delta_positions = _least_norm_exposure_match(hedge_delta.reshape(1, -1), np.array([target_delta], dtype=float))
 
-    if atm_optionid is not None and 'optionid' in current_hedges.columns:
-        atm_mask = (pd.to_numeric(current_hedges['optionid'], errors='coerce') == atm_optionid).to_numpy()
-        if atm_mask.any():
-            atm_idx = int(np.argmax(atm_mask))
-            kappa_h = float(hedge_vega[atm_idx])
-            delta_h = float(hedge_delta[atm_idx])
-            if abs(kappa_h) > np.finfo(float).eps:
-                phi_vega = target_vega / kappa_h
-                phi_delta_under = target_delta - phi_vega * delta_h
-                dv_positions = np.zeros(len(current_hedges), dtype=float)
-                dv_positions[atm_idx] = phi_vega
-                # Distribute remaining delta to the nearest-to-ATM instrument
-                # (approximation when no explicit underlying row is present).
-                under_mask = current_hedges.get('role', pd.Series(dtype=str)) == 'underlying'
-                if under_mask.any():
-                    dv_positions[under_mask.to_numpy().argmax()] = phi_delta_under
-                else:
-                    # Spread residual delta proportionally across non-ATM instruments.
-                    other_mask = ~atm_mask
-                    if other_mask.any() and abs(hedge_delta[other_mask]).sum() > np.finfo(float).eps:
-                        weights = np.abs(hedge_delta[other_mask]) / np.abs(hedge_delta[other_mask]).sum()
-                        dv_positions[other_mask] = phi_delta_under * weights
-                delta_vega_positions = dv_positions
-            else:
-                delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
-        else:
-            delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
-    else:
-        delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
+    if len(current_hedges) == 0:
+        raise ValueError("paper benchmarks require at least one hedge instrument")
+    if not np.all(np.isfinite(hedge_delta)) or not np.all(np.isfinite(hedge_vega)):
+        raise ValueError("paper benchmark Greeks must be finite")
+
+    underlying_idx = _single_underlying_index(current_hedges)
+    underlying_delta = float(hedge_delta[underlying_idx])
+    if abs(underlying_delta) <= np.finfo(float).eps:
+        raise ValueError("underlying hedge row must have nonzero delta")
+
+    delta_positions = np.zeros(len(current_hedges), dtype=float)
+    delta_positions[underlying_idx] = target_delta / underlying_delta
+
+    atm_idx = _single_atm_index(current_hedges, atm_optionid)
+    atm_vega = float(hedge_vega[atm_idx])
+    if abs(atm_vega) <= np.finfo(float).eps:
+        raise ValueError("fixed inception-ATM option has negligible vega")
+    phi_atm = target_vega / atm_vega
+    phi_underlying = (target_delta - phi_atm * float(hedge_delta[atm_idx])) / underlying_delta
+    delta_vega_positions = np.zeros(len(current_hedges), dtype=float)
+    delta_vega_positions[atm_idx] = phi_atm
+    delta_vega_positions[underlying_idx] = phi_underlying
 
     return BenchmarkHedgePositions(delta=delta_positions, delta_vega=delta_vega_positions)
 
@@ -1340,7 +1495,7 @@ def _daily_result(
     hedge_vega_exposure = float(hedge_vega @ positions)
     transaction_cost = float(np.sum(half_spreads * np.abs(trade)))
     before_cost = float(target_change - hedge_change)
-    realized_te = float(before_cost - transaction_cost)
+    realized_te = float(before_cost + transaction_cost)
     return DailyBacktestResult(
         start_date=_as_timestamp(start_date),
         end_date=_as_timestamp(end_date),
@@ -1369,13 +1524,15 @@ def run_daily_backtest(
     alpha_grid: np.ndarray | Iterable[float] | None = None,
     strategies: tuple[str, ...] = ('lasso', 'delta', 'delta_vega'),
     fixed_alpha: float | None = None,
+    fixed_atm_optionid: object | None = None,
 ) -> BacktestSummary:
     """Run model-free daily hedging mechanics over adjacent panel dates.
 
     Realized evaluation uses only observed next-day mids. The sign convention is:
     positions are replicating hedge holdings, so signed realized tracking error is
     target straddle mid-price change minus hedge-portfolio mid-price change minus
-    transaction costs from the rebalance trade.
+    transaction costs from the rebalance trade. At zero rates this is the
+    increment of Z = V - Pi, so transaction costs increase Z.
 
     fixed_alpha: if provided, skip per-day AIC selection and use this alpha for
     all 21 rebalancing days (paper §4.2: alpha selected once at window open).
@@ -1391,6 +1548,9 @@ def run_daily_backtest(
         raise ValueError(f'unsupported backtest strategies: {unknown}')
     if len(panel.trading_dates) < 2:
         return BacktestSummary(results=pd.DataFrame(), skipped_intervals=pd.DataFrame(), skipped_interval_count=0)
+    benchmark_atm_optionid = fixed_atm_optionid if fixed_atm_optionid is not None else panel.fixed_atm_optionid
+    if 'delta_vega' in requested and benchmark_atm_optionid is None:
+        raise ValueError('delta_vega benchmark requires fixed_atm_optionid or panel.fixed_atm_optionid')
 
     n_hedges = len(panel.hedges)
     previous_positions = {strategy: np.zeros(n_hedges, dtype=float) for strategy in requested}
@@ -1458,7 +1618,7 @@ def run_daily_backtest(
             cumulative_z['lasso'] = daily.cumulative_tracking_error
 
         if 'delta' in requested or 'delta_vega' in requested:
-            benchmarks = benchmark_hedge_positions(current_target, current_hedges)
+            benchmarks = benchmark_hedge_positions(current_target, current_hedges, atm_optionid=benchmark_atm_optionid)
             for strategy, positions in (('delta', benchmarks.delta), ('delta_vega', benchmarks.delta_vega)):
                 if strategy not in requested:
                     continue
@@ -1736,8 +1896,8 @@ def run_full_backtest(
     The scenario_source must support a two-key dict return for alpha selection:
       {'train': <scenario_type>, 'validation': <scenario_type>}
     or provide ``alpha_scenarios_for_window(panel)`` returning that dict.
-    Otherwise the alpha-selection call falls back to a 70/30 split of the
-    first scenario draw (legacy behaviour, not paper-compliant).
+    Paper-mode full backtests do not silently fall back to per-day alpha
+    selection when this protocol cannot be satisfied.
 
     Returns a DataFrame with columns:
       window_start, expiry, m0, strategy, terminal_Z_T, skipped_intervals
@@ -1782,25 +1942,20 @@ def run_full_backtest(
                     if hasattr(scenario_source, 'alpha_scenarios_for_window'):
                         alpha_output = scenario_source.alpha_scenarios_for_window(panel)
                     else:
-                        # Draw combined n_fit + n_val scenarios; split by count.
                         alpha_output = _scenario_source_output(
                             scenario_source, panel, first_date, second_date,
                             current_target_rows.reset_index(), current_hedge_rows.reset_index(),
                         )
 
-                    if isinstance(alpha_output, Mapping) and ('train' in alpha_output or 'training' in alpha_output):
-                        train_arr, val_arr = _adapt_train_validation_scenarios(alpha_output)
-                    else:
-                        combined = adapt_scenarios_to_solver(alpha_output)
-                        n_total = combined.target_changes.shape[0]
-                        n_train = min(n_fit, n_total - 1)
-                        train_arr = SolverScenarioArrays(
-                            target_changes=combined.target_changes[:n_train],
-                            hedge_changes=combined.hedge_changes[:n_train],
-                        )
-                        val_arr = SolverScenarioArrays(
-                            target_changes=combined.target_changes[n_train:],
-                            hedge_changes=combined.hedge_changes[n_train:],
+                    if not isinstance(alpha_output, Mapping) or not (
+                        'train' in alpha_output or 'training' in alpha_output
+                    ):
+                        raise ValueError('paper full backtest requires independent train/validation alpha scenarios')
+                    train_arr, val_arr = _adapt_train_validation_scenarios(alpha_output)
+                    if train_arr.target_changes.shape[0] != int(n_fit) or val_arr.target_changes.shape[0] != int(n_val):
+                        raise ValueError(
+                            f'paper alpha selection requires exactly n_fit={n_fit} and n_val={n_val} scenarios; '
+                            f'got {train_arr.target_changes.shape[0]} and {val_arr.target_changes.shape[0]}'
                         )
 
                     half_spreads = pd.to_numeric(
@@ -1824,8 +1979,17 @@ def run_full_backtest(
                         alpha_grid=alpha_grid,
                     )
                     fixed_alphas['lasso'] = selected_alpha
-                except Exception:
-                    fixed_alphas['lasso'] = None  # fall back to per-day selection
+                except Exception as exc:
+                    rows_out.append({
+                        'window_start': panel.start_date,
+                        'expiry': panel.expiry_date,
+                        'm0': m0,
+                        'strategy': 'lasso',
+                        'terminal_Z_T': float('nan'),
+                        'skipped_intervals': -1,
+                        'error': f'alpha_selection_failed: {exc}',
+                    })
+                    continue
 
             summary = run_daily_backtest(
                 panel,
@@ -1833,6 +1997,7 @@ def run_full_backtest(
                 alpha_grid=alpha_grid,
                 strategies=strategies,
                 fixed_alpha=fixed_alphas.get('lasso'),
+                fixed_atm_optionid=panel.fixed_atm_optionid,
             )
 
             # Extract terminal Z_T (cumulative tracking error at expiry).
@@ -1880,13 +2045,22 @@ class DeterministicBacktestScenarioSource:
 def _backtest_self_check_panel() -> HedgePanel:
     dates = pd.DatetimeIndex(['2020-01-02', '2020-01-03', '2020-01-06'])
     target = pd.DataFrame({'role': ['target', 'target'], 'optionid': [101, 102], 'cp_flag': ['C', 'P'], 'strike': [100.0, 100.0], 'exdate': [pd.Timestamp('2020-02-03'), pd.Timestamp('2020-02-03')]})
-    hedges = pd.DataFrame({'role': ['hedge', 'hedge', 'hedge'], 'optionid': [201, 202, 203], 'cp_flag': ['P', 'C', 'C'], 'strike': [95.0, 100.0, 105.0], 'exdate': [pd.Timestamp('2020-02-03')] * 3})
+    hedges = pd.DataFrame(
+        {
+            'role': ['hedge', 'hedge', 'hedge', 'underlying'],
+            'optionid': [201, 202, 203, UNDERLYING_OPTIONID],
+            'cp_flag': ['P', 'C', 'C', UNDERLYING_CP_FLAG],
+            'strike': [95.0, 100.0, 105.0, 100.0],
+            'exdate': [pd.Timestamp('2020-02-03')] * 4,
+        }
+    )
     quote_specs = {
         101: ('target', 'C', 100.0, [5.0, 5.4, 5.1], 0.10, [0.52, 0.55, 0.50], [0.20, 0.19, 0.18]),
         102: ('target', 'P', 100.0, [4.8, 4.5, 4.9], 0.10, [-0.48, -0.45, -0.50], [0.21, 0.20, 0.19]),
         201: ('hedge', 'P', 95.0, [2.1, 2.0, 2.2], 0.04, [-0.22, -0.20, -0.24], [0.12, 0.11, 0.10]),
         202: ('hedge', 'C', 100.0, [3.2, 3.5, 3.3], 0.05, [0.50, 0.53, 0.49], [0.18, 0.17, 0.16]),
         203: ('hedge', 'C', 105.0, [1.7, 1.9, 1.8], 0.03, [0.28, 0.30, 0.27], [0.13, 0.12, 0.11]),
+        UNDERLYING_OPTIONID: ('underlying', UNDERLYING_CP_FLAG, 100.0, [100.0, 101.0, 102.0], 0.0, [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]),
     }
     rows = []
     for optionid, (role, cp_flag, strike, mids, half_spread, deltas, vegas) in quote_specs.items():
@@ -1896,7 +2070,17 @@ def _backtest_self_check_panel() -> HedgePanel:
             rows.append({'date': date, 'exdate': pd.Timestamp('2020-02-03'), 'optionid': optionid, 'role': role, 'cp_flag': cp_flag, 'strike': strike, 'mid_price': mids[idx], 'half_spread': half_spread, 'delta': deltas[idx], 'vega': vegas[idx], 'spot': 100.0 + idx, 'days_to_exp': 30 - idx})
     quotes = pd.DataFrame(rows)
     missing = quote_coverage(quotes, pd.concat([target, hedges], ignore_index=True), dates)
-    return HedgePanel(start_date=dates[0], expiry_date=pd.Timestamp('2020-02-03'), m0=1.0, target=target, hedges=hedges, quotes=quotes, missing_quotes=missing, trading_dates=dates)
+    return HedgePanel(
+        start_date=dates[0],
+        expiry_date=pd.Timestamp('2020-02-03'),
+        m0=1.0,
+        target=target,
+        hedges=hedges,
+        quotes=quotes,
+        missing_quotes=missing,
+        trading_dates=dates,
+        fixed_atm_optionid=202,
+    )
 
 
 def backtest_self_check() -> list[str]:
@@ -1920,9 +2104,9 @@ def backtest_self_check() -> list[str]:
     if np.any(summary.results['transaction_cost'].to_numpy(dtype=float) < -1e-12):
         failures.append('transaction costs must be nonnegative')
     first = summary.results.iloc[0]
-    expected_net = float(first['target_change']) - float(first['hedge_change']) - float(first['transaction_cost'])
+    expected_net = float(first['target_change']) - float(first['hedge_change']) + float(first['transaction_cost'])
     if not np.isclose(float(first['realized_tracking_error']), expected_net):
-        failures.append('realized tracking error does not match documented sign convention')
+        failures.append('realized tracking error does not match paper cost sign convention')
     if 'cumulative_tracking_error' not in summary.results.columns:
         failures.append('cumulative_tracking_error column missing from backtest results')
     else:
@@ -1938,6 +2122,22 @@ def paper_output_self_check() -> list[str]:
     """Run deterministic checks for paper-level reporting helpers."""
 
     failures = []
+    fixture_target = pd.DataFrame({'delta': [0.3], 'vega': [0.4]})
+    fixture_hedges = pd.DataFrame(
+        {
+            'role': ['underlying', 'hedge', 'hedge'],
+            'optionid': [UNDERLYING_OPTIONID, 'ATM', 'DISTRACTOR'],
+            'cp_flag': [UNDERLYING_CP_FLAG, 'C', 'C'],
+            'delta': [1.0, 0.4, 0.7],
+            'vega': [0.0, 0.2, 0.1],
+        }
+    )
+    fixture_positions = benchmark_hedge_positions(fixture_target, fixture_hedges, atm_optionid='ATM')
+    if not np.allclose(fixture_positions.delta, np.array([0.3, 0.0, 0.0])):
+        failures.append(f'paper delta benchmark used non-underlying support: {fixture_positions.delta}')
+    if not np.allclose(fixture_positions.delta_vega, np.array([-0.5, 2.0, 0.0])):
+        failures.append(f'paper delta-vega benchmark used wrong support: {fixture_positions.delta_vega}')
+
     panel = _backtest_self_check_panel()
     summary = run_daily_backtest(panel, DeterministicBacktestScenarioSource(), alpha_grid=np.array([0.0, 0.01, 0.05]))
     expected_strategies = {'lasso', 'delta', 'delta_vega'}

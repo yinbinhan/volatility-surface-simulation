@@ -37,6 +37,9 @@ from backtest_volgan import (
 )
 
 BENCHMARK_VEGA_FLOOR = _hedging.BENCHMARK_VEGA_FLOOR
+from implied_rate import load_rate_table, rate_lookup
+RATE_TABLE: dict = {}      # date -> PCP-implied rate; empty => RISK_FREE
+PHI_VEGA_CAP = 10.0        # delta_vega: freeze vega leg if |phi_vega| would exceed this
 
 
 @dataclass
@@ -218,6 +221,7 @@ def run_one_window(
         return None
 
     t0_date = trading_dates[0]
+    r_win = rate_lookup(RATE_TABLE, pd.Timestamp(t0_date), RISK_FREE)  # single rate per window
     t0_state = get_day_state(t0_date, date_to_idx, log_iv_rows, closes, log_rets)
     if t0_state is None:
         return None
@@ -226,14 +230,14 @@ def run_one_window(
     tc_t0 = _set_tau(target_contracts, tau_t0)
     hc_t0 = _set_tau(hedge_contracts, tau_t0)
 
-    t0_target_prices = bs_price_from_surface(log_iv_t0, spot_t0, tc_t0, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
-    t0_hedge_prices_option = bs_price_from_surface(log_iv_t0, spot_t0, hc_t0, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
+    t0_target_prices = bs_price_from_surface(log_iv_t0, spot_t0, tc_t0, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
+    t0_hedge_prices_option = bs_price_from_surface(log_iv_t0, spot_t0, hc_t0, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
     V0 = float(t0_target_prices.sum())
 
     day0_df = delta_surface_lookup.get(pd.Timestamp(t0_date))
     if day0_df is None:
         return None
-    V0_ds = float(_ds_price(day0_df, spot_t0, tc_t0, r=RISK_FREE).sum())
+    V0_ds = float(_ds_price(day0_df, spot_t0, tc_t0, r=r_win).sum())
     if V0_ds <= 0:
         return None
 
@@ -246,9 +250,9 @@ def run_one_window(
         return None
     spots_tr, iv_tr = scenarios
     spots_val, iv_val = validation
-    dV_tr, dH_tr_option = scenarios_to_solver_arrays(spots_tr, iv_tr, spot_t0, tc_t0, hc_t0, t0_target_prices, t0_hedge_prices_option, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid)
+    dV_tr, dH_tr_option = scenarios_to_solver_arrays(spots_tr, iv_tr, spot_t0, tc_t0, hc_t0, t0_target_prices, t0_hedge_prices_option, r=r_win, m_grid=m_grid, tau_grid=tau_grid)
     dH_tr = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_tr_option, underlying_idx, spots_tr, spot_t0)
-    dV_val, dH_val_option = scenarios_to_solver_arrays(spots_val, iv_val, spot_t0, tc_t0, hc_t0, t0_target_prices, t0_hedge_prices_option, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid)
+    dV_val, dH_val_option = scenarios_to_solver_arrays(spots_val, iv_val, spot_t0, tc_t0, hc_t0, t0_target_prices, t0_hedge_prices_option, r=r_win, m_grid=m_grid, tau_grid=tau_grid)
     dH_val = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_val_option, underlying_idx, spots_val, spot_t0)
     alpha_best = select_alpha_aic(dV_tr, dH_tr, dV_val, dH_val, phi_prev=phi_zero, c_i=c_t0, g0_scale=V0)
 
@@ -280,33 +284,35 @@ def run_one_window(
         hc_ds_t = _set_tau(hedge_contracts, tau_t)
         tc_ds_tp1 = _set_tau(target_contracts, tau_tp1)
         hc_ds_tp1 = _set_tau(hedge_contracts, tau_tp1)
-        prices_target_t = _ds_price(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
-        prices_hedge_t_option = _ds_price(day_df_t, spot_t, hc_ds_t, r=RISK_FREE)
-        prices_target_tp1 = _ds_price(day_df_tp1, spot_tp1, tc_ds_tp1, r=RISK_FREE)
-        prices_hedge_tp1_option = _ds_price(day_df_tp1, spot_tp1, hc_ds_tp1, r=RISK_FREE)
+        prices_target_t = _ds_price(day_df_t, spot_t, tc_ds_t, r=r_win)
+        prices_hedge_t_option = _ds_price(day_df_t, spot_t, hc_ds_t, r=r_win)
+        prices_target_tp1 = _ds_price(day_df_tp1, spot_tp1, tc_ds_tp1, r=r_win)
+        prices_hedge_tp1_option = _ds_price(day_df_tp1, spot_tp1, hc_ds_tp1, r=r_win)
         prices_hedge_t = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_t_option, underlying_idx, spot_t)
         prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
         V_tp1 = float(prices_target_tp1.sum())
         Z_unhedged.append(V_tp1 - V0_ds)
 
-        tgt_deltas, _ = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
+        tgt_deltas, _ = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=r_win)
         phi_delta_new = float(tgt_deltas.sum())
         psi_delta = Pi_delta - phi_delta_new * spot_t
-        Pi_delta_new = phi_delta_new * spot_tp1 + psi_delta * (1 + RISK_FREE / 252)
+        Pi_delta_new = phi_delta_new * spot_tp1 + psi_delta * (1 + r_win / 252)
         Z_delta.append(V_tp1 - Pi_delta_new)
         Pi_delta = Pi_delta_new
 
-        tgt_deltas_dv, tgt_vegas_dv = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=RISK_FREE)
-        hdg_deltas_option, hdg_vegas_option = _ds_greeks(day_df_t, spot_t, hc_ds_t, r=RISK_FREE)
+        tgt_deltas_dv, tgt_vegas_dv = _ds_greeks(day_df_t, spot_t, tc_ds_t, r=r_win)
+        hdg_deltas_option, hdg_vegas_option = _ds_greeks(day_df_t, spot_t, hc_ds_t, r=r_win)
         hdg_deltas_dv, hdg_vegas_dv = assemble_total_greeks(len(sorted_hedges), option_indices, hdg_deltas_option, hdg_vegas_option, underlying_idx)
         kappa_h = float(hdg_vegas_dv[atm_idx])
         if abs(kappa_h) <= BENCHMARK_VEGA_FLOOR:
             return None
         phi_vega_new = float(tgt_vegas_dv.sum()) / kappa_h
+        if abs(phi_vega_new) > PHI_VEGA_CAP:
+            phi_vega_new = phi_vega_atm  # freeze: fixed-ATM vega too small to rebalance on
         phi_delta_under = float(tgt_deltas_dv.sum()) - phi_vega_new * float(hdg_deltas_dv[atm_idx])
         trade_cost_dv = float(c_t[atm_idx] * abs(phi_vega_new - phi_vega_atm))
         psi_dv = Pi_dv - phi_vega_new * prices_hedge_t[atm_idx] - phi_delta_under * spot_t - trade_cost_dv
-        Pi_dv_new = phi_vega_new * prices_hedge_tp1[atm_idx] + phi_delta_under * spot_tp1 + psi_dv * (1 + RISK_FREE / 252)
+        Pi_dv_new = phi_vega_new * prices_hedge_tp1[atm_idx] + phi_delta_under * spot_tp1 + psi_dv * (1 + r_win / 252)
         Z_dv.append(V_tp1 - Pi_dv_new)
         Pi_dv = Pi_dv_new
         phi_vega_atm = phi_vega_new
@@ -315,19 +321,19 @@ def run_one_window(
         hc_nw_t = _set_tau(hedge_contracts, tau_t)
         tc_nw_next = _set_tau(target_contracts, tau_tp1)
         hc_nw_next = _set_tau(hedge_contracts, tau_tp1)
-        prices_target_t_nw = bs_price_from_surface(log_iv_t, spot_t, tc_nw_t, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
-        prices_hedge_t_nw_option = bs_price_from_surface(log_iv_t, spot_t, hc_nw_t, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
+        prices_target_t_nw = bs_price_from_surface(log_iv_t, spot_t, tc_nw_t, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
+        prices_hedge_t_nw_option = bs_price_from_surface(log_iv_t, spot_t, hc_nw_t, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
         scenarios_t = sample_diffusion_scenarios(ctx, date_t, spot_t, n_scenarios, batch_size)
         if scenarios_t is None:
             break
         spots_next, iv_next = scenarios_t
-        dV_t, dH_t_option = scenarios_to_solver_arrays(spots_next, iv_next, spot_t, tc_nw_next, hc_nw_next, prices_target_t_nw, prices_hedge_t_nw_option, r=RISK_FREE, m_grid=m_grid, tau_grid=tau_grid)
+        dV_t, dH_t_option = scenarios_to_solver_arrays(spots_next, iv_next, spot_t, tc_nw_next, hc_nw_next, prices_target_t_nw, prices_hedge_t_nw_option, r=r_win, m_grid=m_grid, tau_grid=tau_grid)
         dH_t = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_t_option, underlying_idx, spots_next, spot_t)
         result = solve_transaction_cost_lasso(dV_t, dH_t, phi_diffusion, c_t, alpha=alpha_best, g0_scale=V0)
         phi_new = result.phi
         trade_cost = float(np.dot(c_t, np.abs(result.trade)))
         psi = Pi_diffusion - float(np.dot(phi_new, prices_hedge_t)) - trade_cost
-        Pi_diffusion_new = float(np.dot(phi_new, prices_hedge_tp1)) + psi * (1 + RISK_FREE / 252)
+        Pi_diffusion_new = float(np.dot(phi_new, prices_hedge_tp1)) + psi * (1 + r_win / 252)
         Z_diffusion.append(V_tp1 - Pi_diffusion_new)
         phi_diffusion = phi_new
         Pi_diffusion = Pi_diffusion_new
@@ -353,9 +359,16 @@ def main() -> None:
     parser.add_argument("--test-start", default="2018-07-01")
     parser.add_argument("--test-end", default="2023-02-28")
     parser.add_argument("--max-windows", type=int, default=52)
+    parser.add_argument("--rate-table", type=Path, default=Path("data/implied_rate.csv"))
+    parser.add_argument("--risk-free-mode", choices=["implied","zero"], default="implied")
     parser.add_argument("--exclude-covid", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    global RATE_TABLE
+    if args.risk_free_mode == "implied" and Path(args.rate_table).exists():
+        RATE_TABLE = load_rate_table(Path(args.rate_table)); print(f"Loaded {len(RATE_TABLE)} implied rates")
+    else:
+        RATE_TABLE = {}; print("risk-free mode: zero (r=0)")
 
     ctx = load_diffusion_context(args.checkpoint, args.train_data, args.processed_dir, args.device)
     state_lookup = build_state_lookup(args.prepared_dir)

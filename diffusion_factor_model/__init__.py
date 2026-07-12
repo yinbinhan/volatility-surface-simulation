@@ -20,4 +20,5 @@ from diffusion_factor_model.fine_tuning import (
     FineTuneStats,
     ArbitrageValidator,
     make_arbitrage_reward_fn,
+    make_arbitrage_reward_fn_iv,
 )

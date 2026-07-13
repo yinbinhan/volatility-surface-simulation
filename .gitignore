@@ -198,3 +198,7 @@ DiT.py
 
 .DS_Store
 results_rqtau/
+
+# agent context routers — local only, never push
+AGENTS.md
+CLAUDE.md

@@ -309,6 +309,15 @@ def bs_price_from_surface(
 
 # ─── Single window backtest ───────────────────────────────────────────────────
 
+def _intrinsic(contracts, spot):
+    """Exact option intrinsic value at settlement: call=max(S-K,0), put=max(K-S,0)."""
+    k = contracts["strike"].to_numpy(dtype=float)
+    is_call = contracts["cp_flag"].astype(str).str.upper().str.startswith("C").to_numpy()
+    call = np.maximum(spot - k, 0.0)
+    put = np.maximum(k - spot, 0.0)
+    return np.where(is_call, call, put)
+
+
 def run_one_window(
     panel: HedgePanel,
     gen: _VolGAN.Generator,
@@ -435,6 +444,8 @@ def run_one_window(
     Pi_dv      = V0_ds
 
     Z_volgan, Z_delta, Z_dv, Z_unhedged = [], [], [], []
+    _ninst_v = []
+    _Vt=[]; _sdlt=[]; _svg=[]; _hdlt=[]; _hvg=[]
 
     for step in range(n_days - 1):
         date_t = trading_dates[step]
@@ -467,6 +478,9 @@ def run_one_window(
         prices_hedge_t_option = _ds_price(day_df_t,   spot_t,   hc_ds_t,   r=r_win)
         prices_target_tp1 = _ds_price(day_df_tp1, spot_tp1, tc_ds_tp1, r=r_win)
         prices_hedge_tp1_option = _ds_price(day_df_tp1, spot_tp1, hc_ds_tp1, r=r_win)
+        if step == n_days - 2:  # terminal day: exact intrinsic payoff settlement at S_T
+            prices_target_tp1 = _intrinsic(tc_ds_tp1, spot_tp1)
+            prices_hedge_tp1_option = _intrinsic(hc_ds_tp1, spot_tp1)
         prices_hedge_t = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_t_option, underlying_idx, spot_t)
         prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
 
@@ -507,10 +521,11 @@ def run_one_window(
         delta_h = float(hdg_deltas_dv[atm_idx])
 
         if abs(kappa_h) <= BENCHMARK_VEGA_FLOOR:
-            return None
-        phi_vega_new   = target_vega_dv / kappa_h
-        if abs(phi_vega_new) > PHI_VEGA_CAP:
-            phi_vega_new = phi_vega_atm  # freeze: fixed-ATM vega too small to rebalance on
+            phi_vega_new = phi_vega_atm  # ATM vega degenerate near expiry: freeze vega leg (keep window for all methods)
+        else:
+            phi_vega_new = target_vega_dv / kappa_h
+            if abs(phi_vega_new) > PHI_VEGA_CAP:
+                phi_vega_new = phi_vega_atm  # freeze: fixed-ATM vega too small to rebalance on
         phi_delta_new  = target_delta_dv - phi_vega_new * delta_h
 
         trade_cost_dv = float(c_t[atm_idx] * abs(phi_vega_new - phi_vega_atm))
@@ -563,14 +578,20 @@ def run_one_window(
         psi        = Pi_volgan - float(np.dot(phi_new, prices_hedge_t)) - trade_cost
         Pi_volgan_new = float(np.dot(phi_new, prices_hedge_tp1)) + psi * (1 + r_win / 252)
         Z_volgan.append(V_tp1 - Pi_volgan_new)
+        _ninst_v.append(int((np.abs(phi_new) > 1e-6).sum()))
+        _Vt.append(V_tp1)
+        _sdlt.append(float(tgt_deltas_dv.sum())); _svg.append(float(tgt_vegas_dv.sum()))
+        _hdlt.append(float(tgt_deltas_dv.sum()) - float(np.dot(phi_new, hdg_deltas_dv)))
+        _hvg.append(float(tgt_vegas_dv.sum()) - float(np.dot(phi_new, hdg_vegas_dv)))
 
         phi_volgan = phi_new
         Pi_volgan  = Pi_volgan_new
 
     if not Z_volgan:
         return None
+    print(f"  [n_instruments volgan mean={np.mean(_ninst_v):.2f}]", end="")
 
-    return {"unhedged": Z_unhedged, "delta": Z_delta, "delta_vega": Z_dv, "volgan": Z_volgan}
+    return {"unhedged": Z_unhedged, "delta": Z_delta, "delta_vega": Z_dv, "volgan": Z_volgan, "n_instruments": _ninst_v, "V_t": _Vt, "straddle_delta": _sdlt, "straddle_vega": _svg, "hedged_delta": _hdlt, "hedged_vega": _hvg, "alpha": float(alpha_best)}
 
 
 # ─── Evaluation ──────────────────────────────────────────────────────────────
@@ -757,6 +778,13 @@ def main():
                     "rebalance_date": pd.Timestamp(rebalance_date).date().isoformat(),
                     "interval_end": pd.Timestamp(interval_end).date().isoformat(),
                     "row_in_window": row_in_window,
+                    "n_instruments": window_results.get("n_instruments", [None]*len(interval_starts))[row_in_window],
+                    "V_t": window_results["V_t"][row_in_window],
+                    "straddle_delta": window_results["straddle_delta"][row_in_window],
+                    "straddle_vega": window_results["straddle_vega"][row_in_window],
+                    "hedged_delta": window_results["hedged_delta"][row_in_window],
+                    "hedged_vega": window_results["hedged_vega"][row_in_window],
+                    "alpha": window_results.get("alpha"),
                 })
             print(f"OK ({n_days_done} days, "
                   f"Z_volgan std={np.std(window_results['volgan']):.3f})")

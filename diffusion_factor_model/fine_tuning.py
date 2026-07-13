@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm.auto import tqdm
+from torch.utils.checkpoint import checkpoint as _grad_ckpt
 
 
 class LoRALinear(nn.Module):
@@ -227,6 +228,55 @@ def make_arbitrage_reward_fn(validator: ArbitrageValidator):
     return reward_fn
 
 
+# Grid for the 22-day shared-grid IV surfaces. MUST stay identical to
+# gen_arbitrage_ccdf.py (validated to 6 significant figures against
+# day22_violation_summary.csv). Layout is [tau (rows), moneyness (cols)].
+SHARED_GRID_MONEYNESS = (0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.3, 1.4)
+SHARED_GRID_TAU = (0.0027397260273972603, 0.019230769230769232, 0.038461538461538464,
+                   0.08333333333333333, 0.16666666666666666, 0.25, 0.5, 0.75, 1.0)
+
+
+def make_arbitrage_reward_fn_iv(m_grid=SHARED_GRID_MONEYNESS, tau_grid=SHARED_GRID_TAU,
+                                R: float = 0.0, eps: float = 1e-8):
+    """Arbitrage reward for 2-channel (log-IV, return) surfaces.
+
+    Reconstructs the normalized call-price surface C/S from channel 0 (log-IV)
+    via Black-Scholes (R=0 by default) on the real (moneyness, tau) grid, then
+    penalizes L1 (calendar), L2 (vertical) and L3 (butterfly) static-arbitrage
+    violations. Differentiable torch port of cs_surface + violations in
+    gen_arbitrage_ccdf.py. Input surfaces are [B, S, C, H=tau, W=moneyness];
+    channel 0 is log-IV. Returns reward = -mean_seq(L1+L2+L3), shape [B].
+    """
+    m_t = torch.tensor(m_grid, dtype=torch.float32)
+    tau_t = torch.tensor(tau_grid, dtype=torch.float32)
+    dm_t = (m_t[1:] - m_t[:-1]).clamp_min(eps)
+    dt_t = (tau_t[1:] - tau_t[:-1]).clamp_min(eps)
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+
+    def reward_fn(samples: torch.Tensor) -> torch.Tensor:
+        dev = samples.device
+        m = m_t.to(dev); tau = tau_t.to(dev); dm = dm_t.to(dev); dt = dt_t.to(dev)
+        iv = torch.exp(samples[:, :, 0])                        # [B, S, tau, m]
+        TT = tau.view(1, 1, -1, 1)
+        MM = m.view(1, 1, 1, -1)
+        sq = iv * torch.sqrt(TT)
+        d1 = (-torch.log(MM) + (R + 0.5 * iv ** 2) * TT) / sq
+        d2 = d1 - sq
+        ncdf = lambda x: 0.5 * (1.0 + torch.erf(x * inv_sqrt2))
+        price = ncdf(d1) - MM * torch.exp(-R * TT) * ncdf(d2)   # [B, S, tau, m]
+
+        diff_t = price[:, :, :-1, :] - price[:, :, 1:, :]
+        l1 = torch.relu(tau[:-1].view(1, 1, -1, 1) * diff_t / dt.view(1, 1, -1, 1)).sum(dim=(-2, -1))
+        diff_m = price[:, :, :, 1:] - price[:, :, :, :-1]
+        slope = diff_m / dm.view(1, 1, 1, -1)
+        l2 = torch.relu(slope).sum(dim=(-2, -1))
+        l3 = torch.relu(slope[:, :, :, :-1] - slope[:, :, :, 1:]).sum(dim=(-2, -1))
+        total = (l1 + l2 + l3).mean(dim=1)                      # [B]
+        return -total
+
+    return reward_fn
+
+
 class OnlineDDPMLoRAFineTuner:
     """Online policy-gradient fine-tuning for sequential DDPM with LoRA.
 
@@ -249,6 +299,7 @@ class OnlineDDPMLoRAFineTuner:
         normalize_rewards: bool = True,
         max_grad_norm: float = 1.0,
         transition_chunk_size: int = 0,
+        grad_checkpoint: bool = True,
         device: Optional[torch.device] = None,
     ):
         self.diffusion = diffusion
@@ -258,6 +309,7 @@ class OnlineDDPMLoRAFineTuner:
         self.normalize_rewards = normalize_rewards
         self.max_grad_norm = float(max_grad_norm)
         self.transition_chunk_size = int(transition_chunk_size)
+        self.grad_checkpoint = bool(grad_checkpoint)
 
         inject_lora(
             self.diffusion.model,
@@ -306,9 +358,16 @@ class OnlineDDPMLoRAFineTuner:
                 times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
                 context, key_padding_mask = model.build_context(seq_context, target_indices, x_t)
 
-                mean, _, x_start = self._compute_transition_params(
-                    model, context, key_padding_mask, target_indices, x_t, times
-                )
+                if self.grad_checkpoint:
+                    mean, _, x_start = _grad_ckpt(
+                        self._compute_transition_params,
+                        model, context, key_padding_mask, target_indices, x_t, times,
+                        use_reentrant=False,
+                    )
+                else:
+                    mean, _, x_start = self._compute_transition_params(
+                        model, context, key_padding_mask, target_indices, x_t, times
+                    )
 
                 if t == 0:
                     x_prev = x_start
@@ -333,14 +392,20 @@ class OnlineDDPMLoRAFineTuner:
         seq = torch.stack(generated_states, dim=1)
         return seq, transitions
 
-    def _compute_kl(self, transitions: Iterable[Dict[str, torch.Tensor]]) -> torch.Tensor:
+    def _accumulate_kl_grads(self, transitions: Iterable[Dict[str, torch.Tensor]], loss_scale: float = 1.0) -> float:
+        """Per-chunk KL backward: accumulate grads chunk-by-chunk and free each graph.
+
+        Mathematically identical to summing chunk KLs then a single backward, but the
+        graph for a chunk is released after its backward, so peak memory is one chunk
+        instead of all transitions at once. Returns the unweighted total KL (float) for
+        logging; gradients are already scaled by (loss_scale * self.kl_weight).
+        """
         transitions = list(transitions)
         if len(transitions) == 0:
             raise ValueError("No transitions collected from rollout")
 
         chunk_size = self.transition_chunk_size if self.transition_chunk_size > 0 else len(transitions)
-        total_kl = None
-
+        total_kl = 0.0
 
         for start_idx in range(0, len(transitions), chunk_size):
             chunk = transitions[start_idx:start_idx + chunk_size]
@@ -369,17 +434,22 @@ class OnlineDDPMLoRAFineTuner:
                     times,
                 )
 
-            kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1)
-
-            if total_kl is None:
-                total_kl = kl.sum()
-            else:
-                total_kl = total_kl + kl.sum()
-
+            kl = (pred_noise_new - pred_noise_ref).pow(2).flatten(start_dim=1).mean(dim=-1).sum()
+            (loss_scale * self.kl_weight * kl).backward()
+            total_kl += float(kl.detach().item())
 
         return total_kl
 
-    def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None) -> FineTuneStats:
+    def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+             *, zero_grad: bool = True, do_step: bool = True, loss_scale: float = 1.0) -> FineTuneStats:
+        """One rollout + backward.
+
+        Reward and KL backward are done separately so their (independent) graphs are
+        released as soon as each is consumed. For gradient accumulation, call with
+        zero_grad only on the first microstep, do_step only on the last, and
+        loss_scale=1/num_microsteps; grads accumulate across microsteps and the
+        optimizer/clip fire once at the end.
+        """
         reward_fn = reward_fn or self.reward_fn
         if reward_fn is None:
             raise ValueError("reward_fn is required. Plug your sequence reward API via constructor or step(...).")
@@ -399,28 +469,33 @@ class OnlineDDPMLoRAFineTuner:
         if self.normalize_rewards:
             rewards = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
 
-        # kl_sum = self._compute_kl_only(transitions)
+        if zero_grad:
+            self.optimizer.zero_grad(set_to_none=True)
 
+        # Reward term: backward through the (checkpointed) rollout chain, then free it.
         reward_loss = -rewards.mean()
-        kl_loss = self._compute_kl(transitions)
-        report_loss = reward_loss + self.kl_weight * kl_loss
-        grad_objective = report_loss
-        loss = report_loss
+        (loss_scale * reward_loss).backward()
 
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.diffusion.model.parameters() if p.requires_grad],
-            self.max_grad_norm,
-        )
-        grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
-        self.optimizer.step()
+        # KL term: per-chunk backward (grads already scaled inside).
+        kl_value = self._accumulate_kl_grads(transitions, loss_scale=loss_scale)
+
+        report_loss = float(reward_loss.item()) + self.kl_weight * kl_value
+
+        if do_step:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in self.diffusion.model.parameters() if p.requires_grad],
+                self.max_grad_norm,
+            )
+            grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+            self.optimizer.step()
+        else:
+            grad_norm_value = 0.0
 
         with torch.no_grad():
             return FineTuneStats(
-                loss=float(loss.item()),
+                loss=float(report_loss),
                 policy_loss=float(reward_loss.item()),
-                kl_loss=float(kl_loss.item()),
+                kl_loss=float(kl_value),
                 reward_mean=float(rewards.mean().item()),
                 reward_std=float(rewards.std(unbiased=False).item()),
                 grad_norm=float(grad_norm_value),

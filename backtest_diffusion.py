@@ -33,10 +33,12 @@ from backtest_volgan import (
     _hedging,
     _ds_greeks,
     _ds_price,
+    _intrinsic,
     _set_tau,
 )
 
 BENCHMARK_VEGA_FLOOR = _hedging.BENCHMARK_VEGA_FLOOR
+LAST_DROP = None  # diag: reason a window returned None
 from implied_rate import load_rate_table, rate_lookup
 RATE_TABLE: dict = {}      # date -> PCP-implied rate; empty => RISK_FREE
 PHI_VEGA_CAP = 10.0        # delta_vega: freeze vega leg if |phi_vega| would exceed this
@@ -153,8 +155,10 @@ def sample_diffusion_scenarios(
     n_scenarios: int,
     batch_size: int,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    global LAST_DROP
     idx = ctx.date_to_idx.get(pd.Timestamp(date_t))
     if idx is None or idx < 20:
+        LAST_DROP = f"prefix idx<20 @{pd.Timestamp(date_t).date()} (idx={idx})"
         return None
 
     prefix_iv = ctx.log_iv[idx - 20 : idx + 1]  # [21, m, tau]
@@ -202,15 +206,16 @@ def run_one_window(
     batch_size: int,
     delta_surface_lookup: dict[pd.Timestamp, pd.DataFrame],
 ):
+    global LAST_DROP
     dates, log_iv_rows, closes, log_rets, date_to_idx, m_grid, tau_grid, grid_order = state_lookup
     trading_dates = panel.trading_dates
     sorted_hedges, option_hedges, option_indices, underlying_idx = split_hedge_universe(panel)
     hedge_ids = list(sorted_hedges["optionid"])
     if panel.fixed_atm_optionid is None:
-        return None
+        LAST_DROP = 'fixed_atm None'; return None
     atm_matches = sorted_hedges["optionid"].map(lambda value: str(value) == str(panel.fixed_atm_optionid)).to_numpy(dtype=bool)
     if int(atm_matches.sum()) != 1:
-        return None
+        LAST_DROP = 'atm_match!=1'; return None
     atm_idx = int(np.flatnonzero(atm_matches)[0])
 
     target_contracts = panel.target.sort_values(["cp_flag", "strike"])[["cp_flag", "strike", "ttm"]].rename(columns={"ttm": "tau"}).reset_index(drop=True)
@@ -218,13 +223,13 @@ def run_one_window(
 
     expiry = panel.expiry_date
     if len(trading_dates) < 2:
-        return None
+        LAST_DROP = 'trading_dates<2'; return None
 
     t0_date = trading_dates[0]
     r_win = rate_lookup(RATE_TABLE, pd.Timestamp(t0_date), RISK_FREE)  # single rate per window
     t0_state = get_day_state(t0_date, date_to_idx, log_iv_rows, closes, log_rets)
     if t0_state is None:
-        return None
+        LAST_DROP = 't0_state None'; return None
     log_iv_t0, spot_t0, *_ = t0_state
     tau_t0 = max((expiry - t0_date).days / 365, 1.0 / 365)
     tc_t0 = _set_tau(target_contracts, tau_t0)
@@ -236,10 +241,10 @@ def run_one_window(
 
     day0_df = delta_surface_lookup.get(pd.Timestamp(t0_date))
     if day0_df is None:
-        return None
+        LAST_DROP = 'day0 delta None'; return None
     V0_ds = float(_ds_price(day0_df, spot_t0, tc_t0, r=r_win).sum())
     if V0_ds <= 0:
-        return None
+        LAST_DROP = 'V0_ds<=0'; return None
 
     phi_zero = np.zeros(len(hedge_ids))
     c_t0 = get_half_spreads(panel.quotes, t0_date, hedge_ids)
@@ -247,7 +252,7 @@ def run_one_window(
     scenarios = sample_diffusion_scenarios(ctx, t0_date, spot_t0, n_scenarios, batch_size)
     validation = sample_diffusion_scenarios(ctx, t0_date, spot_t0, n_val, batch_size)
     if scenarios is None or validation is None:
-        return None
+        LAST_DROP = 't0 scenarios None'; return None
     spots_tr, iv_tr = scenarios
     spots_val, iv_val = validation
     dV_tr, dH_tr_option = scenarios_to_solver_arrays(spots_tr, iv_tr, spot_t0, tc_t0, hc_t0, t0_target_prices, t0_hedge_prices_option, r=r_win, m_grid=m_grid, tau_grid=tau_grid)
@@ -262,6 +267,9 @@ def run_one_window(
     Pi_dv = V0_ds
     phi_vega_atm = 0.0
     Z_diffusion, Z_delta, Z_dv, Z_unhedged = [], [], [], []
+    _brk = None
+    _ninst = []
+    _Vt=[]; _sdlt=[]; _svg=[]; _hdlt=[]; _hvg=[]
 
     for step in range(len(trading_dates) - 1):
         date_t = trading_dates[step]
@@ -269,7 +277,7 @@ def run_one_window(
         state_t = get_day_state(date_t, date_to_idx, log_iv_rows, closes, log_rets)
         state_tp1 = get_day_state(date_tp1, date_to_idx, log_iv_rows, closes, log_rets)
         if state_t is None or state_tp1 is None:
-            break
+            _brk = f"state None @step{step}"; break
         log_iv_t, spot_t, *_ = state_t
         _, spot_tp1, *_ = state_tp1
         tau_t = max((expiry - date_t).days / 365, 1.0 / 365)
@@ -277,7 +285,7 @@ def run_one_window(
         day_df_t = delta_surface_lookup.get(pd.Timestamp(date_t))
         day_df_tp1 = delta_surface_lookup.get(pd.Timestamp(date_tp1))
         if day_df_t is None or day_df_tp1 is None:
-            break
+            _brk = f"delta None @step{step}"; break
         c_t = get_half_spreads(panel.quotes, date_t, hedge_ids, fallback=c_t0)
 
         tc_ds_t = _set_tau(target_contracts, tau_t)
@@ -290,6 +298,10 @@ def run_one_window(
         prices_hedge_tp1_option = _ds_price(day_df_tp1, spot_tp1, hc_ds_tp1, r=r_win)
         prices_hedge_t = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_t_option, underlying_idx, spot_t)
         prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
+        if step == len(trading_dates) - 2:  # terminal day: exact intrinsic payoff settlement at S_T
+            prices_target_tp1 = _intrinsic(tc_ds_tp1, spot_tp1)
+            prices_hedge_tp1_option = _intrinsic(hc_ds_tp1, spot_tp1)
+            prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
         V_tp1 = float(prices_target_tp1.sum())
         Z_unhedged.append(V_tp1 - V0_ds)
 
@@ -305,10 +317,11 @@ def run_one_window(
         hdg_deltas_dv, hdg_vegas_dv = assemble_total_greeks(len(sorted_hedges), option_indices, hdg_deltas_option, hdg_vegas_option, underlying_idx)
         kappa_h = float(hdg_vegas_dv[atm_idx])
         if abs(kappa_h) <= BENCHMARK_VEGA_FLOOR:
-            return None
-        phi_vega_new = float(tgt_vegas_dv.sum()) / kappa_h
-        if abs(phi_vega_new) > PHI_VEGA_CAP:
-            phi_vega_new = phi_vega_atm  # freeze: fixed-ATM vega too small to rebalance on
+            phi_vega_new = phi_vega_atm  # ATM vega degenerate near expiry: freeze vega leg (keep window for all methods)
+        else:
+            phi_vega_new = float(tgt_vegas_dv.sum()) / kappa_h
+            if abs(phi_vega_new) > PHI_VEGA_CAP:
+                phi_vega_new = phi_vega_atm  # freeze: fixed-ATM vega too small to rebalance on
         phi_delta_under = float(tgt_deltas_dv.sum()) - phi_vega_new * float(hdg_deltas_dv[atm_idx])
         trade_cost_dv = float(c_t[atm_idx] * abs(phi_vega_new - phi_vega_atm))
         psi_dv = Pi_dv - phi_vega_new * prices_hedge_t[atm_idx] - phi_delta_under * spot_t - trade_cost_dv
@@ -325,7 +338,7 @@ def run_one_window(
         prices_hedge_t_nw_option = bs_price_from_surface(log_iv_t, spot_t, hc_nw_t, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
         scenarios_t = sample_diffusion_scenarios(ctx, date_t, spot_t, n_scenarios, batch_size)
         if scenarios_t is None:
-            break
+            _brk = f"scenarios_t None @step{step}"; break
         spots_next, iv_next = scenarios_t
         dV_t, dH_t_option = scenarios_to_solver_arrays(spots_next, iv_next, spot_t, tc_nw_next, hc_nw_next, prices_target_t_nw, prices_hedge_t_nw_option, r=r_win, m_grid=m_grid, tau_grid=tau_grid)
         dH_t = assemble_total_scenarios(len(sorted_hedges), option_indices, dH_t_option, underlying_idx, spots_next, spot_t)
@@ -335,12 +348,18 @@ def run_one_window(
         psi = Pi_diffusion - float(np.dot(phi_new, prices_hedge_t)) - trade_cost
         Pi_diffusion_new = float(np.dot(phi_new, prices_hedge_tp1)) + psi * (1 + r_win / 252)
         Z_diffusion.append(V_tp1 - Pi_diffusion_new)
+        _ninst.append(int((np.abs(phi_new) > 1e-6).sum()))
+        _Vt.append(V_tp1)
+        _sdlt.append(float(tgt_deltas_dv.sum())); _svg.append(float(tgt_vegas_dv.sum()))
+        _hdlt.append(float(tgt_deltas_dv.sum()) - float(np.dot(phi_new, hdg_deltas_dv)))
+        _hvg.append(float(tgt_vegas_dv.sum()) - float(np.dot(phi_new, hdg_vegas_dv)))
         phi_diffusion = phi_new
         Pi_diffusion = Pi_diffusion_new
 
     if not Z_diffusion:
-        return None
-    return {"unhedged": Z_unhedged, "delta": Z_delta, "delta_vega": Z_dv, "diffusion": Z_diffusion}
+        LAST_DROP = f"empty Z (break={_brk})"; return None
+    print(f"  [n_instruments diffusion mean={np.mean(_ninst):.2f}]", end="")
+    return {"unhedged": Z_unhedged, "delta": Z_delta, "delta_vega": Z_dv, "diffusion": Z_diffusion, "n_instruments": _ninst, "V_t": _Vt, "straddle_delta": _sdlt, "straddle_vega": _svg, "hedged_delta": _hdlt, "hedged_vega": _hvg, "alpha": float(alpha_best)}
 
 
 def main() -> None:
@@ -401,7 +420,7 @@ def main() -> None:
                 continue
             window_results = run_one_window(panel, ctx, state_lookup, args.n_scenarios, args.n_val, args.batch_size, delta_surface_lookup)
             if window_results is None:
-                print("SKIP (insufficient data)")
+                print(f"SKIP (insufficient data) [{LAST_DROP}]")
                 continue
             for method in results_all:
                 results_all[method].extend(window_results[method])
@@ -416,6 +435,13 @@ def main() -> None:
                     "rebalance_date": pd.Timestamp(rebalance_date).date().isoformat(),
                     "interval_end": pd.Timestamp(interval_end).date().isoformat(),
                     "row_in_window": row_in_window,
+                    "n_instruments": window_results.get("n_instruments", [None]*len(interval_starts))[row_in_window],
+                    "V_t": window_results["V_t"][row_in_window],
+                    "straddle_delta": window_results["straddle_delta"][row_in_window],
+                    "straddle_vega": window_results["straddle_vega"][row_in_window],
+                    "hedged_delta": window_results["hedged_delta"][row_in_window],
+                    "hedged_vega": window_results["hedged_vega"][row_in_window],
+                    "alpha": window_results.get("alpha"),
                 })
             print(f"OK ({n_days_done} days, Z_diffusion std={np.std(window_results['diffusion']):.3f})")
             n_windows += 1

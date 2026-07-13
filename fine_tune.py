@@ -19,6 +19,7 @@ from diffusion_factor_model import (
     OnlineDDPMLoRAFineTuner,
     SequentialGaussianDiffusion,
     make_arbitrage_reward_fn,
+    make_arbitrage_reward_fn_iv,
 )
 
 
@@ -105,9 +106,15 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--transition_chunk_size", type=int, default=0,
                         help="Number of transitions per KL batch (0 = all transitions).")
+    parser.add_argument("--grad_checkpoint", type=int, default=1,
+                        help="1 = gradient-checkpoint the rollout denoising chain (memory-frugal, exact grads).")
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Microbatch rollouts accumulated before each optimizer step.")
     parser.add_argument("--results_root", type=str, default=None)
     parser.add_argument("--gradient_mode", type=str, default="hybrid", choices=["direct", "reinforce", "hybrid"])
     parser.add_argument("--strict_grid_match", action="store_true", help="Require grid_size to match generated surface resolution")
+    parser.add_argument("--reward_mode", type=str, default="price_channel", choices=["price_channel", "iv_bs"],
+                        help="price_channel: channel-1 price (3-ch data). iv_bs: reconstruct C/S from channel-0 log-IV via BS (2-ch shared-grid data).")
     args = parser.parse_args()
 
     timestamp = int(time.time())
@@ -140,10 +147,15 @@ def main():
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     diffusion.load_state_dict(state, strict=False)
 
-    m_vals = np.linspace(0.8, 1.2, args.grid_size)
-    t_vals = np.linspace(0.1, 2.0, args.grid_size)
-    validator = ArbitrageValidator(m_vals, t_vals, strict_grid_match=args.strict_grid_match)
-    reward_fn = make_arbitrage_reward_fn(validator)
+    if args.reward_mode == "iv_bs":
+        # 2-channel (log-IV, return) surfaces: reconstruct C/S via BS on the real
+        # shared grid, matching gen_arbitrage_ccdf.py (validated).
+        reward_fn = make_arbitrage_reward_fn_iv()
+    else:
+        m_vals = np.linspace(0.8, 1.2, args.grid_size)
+        t_vals = np.linspace(0.1, 2.0, args.grid_size)
+        validator = ArbitrageValidator(m_vals, t_vals, strict_grid_match=args.strict_grid_match)
+        reward_fn = make_arbitrage_reward_fn(validator)
 
     tuner = OnlineDDPMLoRAFineTuner(
         diffusion,
@@ -153,6 +165,7 @@ def main():
         lora_rank=args.lora_rank,
         max_grad_norm=args.max_grad_norm,
         transition_chunk_size=args.transition_chunk_size,
+        grad_checkpoint=bool(args.grad_checkpoint),
         device=device,
         normalize_rewards=False,
     )
@@ -162,7 +175,14 @@ def main():
 
     pbar = tqdm(range(1, args.steps + 1), desc="Fine-tuning", unit="iter")
     for step in pbar:
-        stats = tuner.step(args.batch_size)
+        ga = max(1, args.grad_accum)
+        for micro in range(ga):
+            stats = tuner.step(
+                args.batch_size,
+                zero_grad=(micro == 0),
+                do_step=(micro == ga - 1),
+                loss_scale=1.0 / ga,
+            )
 
         writer.add_scalar("FT/loss", stats.loss, step)
         writer.add_scalar("FT/policy_loss", stats.policy_loss, step)

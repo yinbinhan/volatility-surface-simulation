@@ -17,7 +17,7 @@ from delta_surface import (
     load_delta_surface,
     price_contracts as _ds_price,
 )
-from diffusion_factor_model import ConditionalTransformer, SequentialGaussianDiffusion
+from adapted_sequential_diffusion import ConditionalTransformer, SequentialGaussianDiffusion
 from hedging import (
     BENCHMARK_VEGA_FLOOR,
     build_instrument_panel,

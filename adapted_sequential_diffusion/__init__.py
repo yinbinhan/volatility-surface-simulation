@@ -1,8 +1,8 @@
 """
-Diffusion Factor Model: A diffusion-based framework for financial factor modeling
+Adapted Sequential Diffusion for implied-volatility surface simulation
 """
 
-from diffusion_factor_model.diffusion_factor_model import (
+from adapted_sequential_diffusion.sequential_diffusion import (
     Unet,
     GaussianDiffusion,
     SequentialGaussianDiffusion,
@@ -14,7 +14,7 @@ from diffusion_factor_model.diffusion_factor_model import (
 __version__ = "0.1.0"
 
 
-from diffusion_factor_model.fine_tuning import (
+from adapted_sequential_diffusion.fine_tuning import (
     LoRALinear,
     OnlineDDPMLoRAFineTuner,
     FineTuneStats,

@@ -3,7 +3,7 @@
 Built from the processed shared-grid market tensor (no model involved): Figure 1
 is the average call/put bid-ask spread surfaces (USD), and Figure 2 the average
 ATM spread against the arbitrage penalty over the full sample. The per-date
-penalty reuses ArbitrageValidator (diffusion_factor_model/fine_tuning.py), which
+penalty reuses ArbitrageValidator (adapted_sequential_diffusion/fine_tuning.py), which
 scores no-arbitrage violations on the call-price (C/S) surface.
 """
 
@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3d projection)
 
-from diffusion_factor_model.fine_tuning import ArbitrageValidator
+from adapted_sequential_diffusion.fine_tuning import ArbitrageValidator
 
 
 def load_tensor(npz_path: Path):

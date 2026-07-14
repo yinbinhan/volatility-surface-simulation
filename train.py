@@ -1,5 +1,5 @@
 """
-Training script for Diffusion Factor Model
+Training script for Adapted Sequential Diffusion
 """
 
 import torch
@@ -15,7 +15,7 @@ import math
 from tqdm import tqdm
 
 
-from diffusion_factor_model.diffusion_factor_model import (
+from adapted_sequential_diffusion.sequential_diffusion import (
     ConditionalTransformer,
     SequentialGaussianDiffusion,
     Trainer,
@@ -425,7 +425,7 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     return model_dir, sample_dir
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train diffusion factor model on specific data file")
+    parser = argparse.ArgumentParser(description="Train Adapted Sequential Diffusion on a data file")
     parser.add_argument("--data_path", type=str, required=True, 
                       help="Path to the data file for training")
     parser.add_argument("--seed", type=int, default=None, 

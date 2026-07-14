@@ -1,25 +1,28 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="diffusion-factor-model",
+    name="adapted-sequential-diffusion",
     version="0.1.0",
-    description="Diffusion Factor Models: Generating High-Dimensional Financial Data with Factor Structure",
-    author="xuym",
-    author_email="xuyumin@pku.edu.cn",
-    url="https://github.com/xuym/diffusion-factor-model",
+    description=(
+        "Adapted sequential diffusion for SPX implied-volatility surface "
+        "simulation and option hedging"
+    ),
+    url="https://github.com/yinbinhan/volatility-surface-simulation",
     packages=find_packages(),
     install_requires=[
         "torch>=1.10.0",
-        "numpy>=1.20.0",
-        "scipy>=1.7.0",
-        "einops",
-        "tqdm",
-        "matplotlib",
+        "torchvision",
+        "einops>=0.6.0",
         "ema-pytorch>=0.2.0",
         "accelerate>=0.20.0",
+        "numpy>=1.20.0",
+        "scipy>=1.7.0",
+        "packaging",
         "pandas>=1.3.0",
-        "scikit-learn>=1.0.0",
-        "seaborn>=0.11.0",
+        "matplotlib>=3.5.0",
+        "Pillow",
+        "tqdm",
+        "tensorboard",
     ],
     classifiers=[
         "Development Status :: 3 - Alpha",

@@ -183,7 +183,6 @@ cython_debug/
 /samples/
 /empirical_analysis_data/
 /simulation_experiment_data/
-/eval/vol_simulation/
 /results/
 /results_rqtau/
 /figs/

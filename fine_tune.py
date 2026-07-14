@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 import config.config as config
-from diffusion_factor_model import (
+from adapted_sequential_diffusion import (
     ArbitrageValidator,
     ConditionalTransformer,
     OnlineDDPMLoRAFineTuner,

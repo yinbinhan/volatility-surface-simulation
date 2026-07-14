@@ -1,5 +1,5 @@
 """
-Configuration for Diffusion Factor Model
+Configuration for Adapted Sequential Diffusion
 """
 
 import os
@@ -18,7 +18,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(SAMPLES_DIR, exist_ok=True)
 
 # Experiment naming
-EXP_PREFIX = "dfm"  # Prefix for experiment IDs
+EXP_PREFIX = "asd"  # Prefix for experiment IDs
 
 # Core settings
 SEED = 3407

@@ -6,7 +6,7 @@ The pipeline:
 
 1. smooth licensed OptionMetrics quotes onto a common surface grid;
 2. construct rolling sequences of implied-volatility surfaces and SPX returns;
-3. train a conditional sequential diffusion model;
+3. train the Adapted Sequential Diffusion model;
 4. fine-tune low-rank adapters with an implementation-level static-arbitrage penalty; and
 5. use generated one-day-ahead scenarios to construct option hedges and compare them with unhedged, delta, and delta-vega strategies.
 
@@ -14,7 +14,7 @@ The pipeline:
 
 ## Method overview
 
-The reference experiment conditions on 21 trading days and generates the next day's SPX log return jointly with its log-implied-volatility surface. A causal transformer parameterizes the score network in a sequential Gaussian diffusion model. The surface is represented on an 11 × 9 moneyness-maturity grid.
+The Adapted Sequential Diffusion model conditions on 21 trading days and generates the next day's SPX log return jointly with its log-implied-volatility surface. A causal transformer parameterizes the score network in a sequential Gaussian diffusion process. The surface is represented on an 11 × 9 moneyness-maturity grid.
 
 LoRA fine-tuning penalizes calendar, vertical-spread, and butterfly violations after reconstructing normalized call prices from generated implied volatilities. This penalty is a numerical diagnostic and training objective; it is not a certificate that every sampled surface is arbitrage-free.
 
@@ -32,7 +32,7 @@ daily 11 x 9 volatility surfaces
 rolling tensors (N, S, C, H, W)
           |
           v
-conditional sequential diffusion
+adapted sequential diffusion
           |
           +--> LoRA fine-tuning with arbitrage penalties
           |
@@ -84,7 +84,7 @@ No confidence intervals or hypothesis tests are reported. Absolute values should
 |---|---|
 | `shared_grid_preprocessing.py` | Convert raw SPX option quotes into daily 11 × 9 surfaces |
 | `prepare_shared_grid_data.py` | Convert daily surfaces into rolling diffusion tensors |
-| `diffusion_factor_model/` | Transformer and sequential Gaussian diffusion implementation |
+| `adapted_sequential_diffusion/` | Adapted sequential diffusion implementation |
 | `config/config.py` | Model, optimization, and sampling defaults |
 | `train.py` | Base training, conditional sampling, and run metadata |
 | `fine_tune.py` | Online LoRA fine-tuning |
@@ -95,7 +95,8 @@ No confidence intervals or hypothesis tests are reported. Absolute values should
 | `delta_surface.py` | Delta-grid interpolation and Black-Scholes marking |
 | `implied_rate.py` | Put-call-parity net-carry estimator |
 | `backtest_diffusion.py` | Diffusion, unhedged, delta, and delta-vega evaluation |
-| `eval_hedging.py` | Aggregate hedging metrics |
+| `plot_surface_data.py` | Market-surface spread and arbitrage-diagnostic figures |
+| `summarize_hedging_results.py` | Aggregate hedging metrics and tables |
 | `plot_hedging_figures.py` | Hedging figures |
 | `sanity_check.py` | Window-set and result diagnostics |
 | `build_CD.py` | Build selected tables and figures from a local result bundle |
@@ -111,10 +112,9 @@ python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m pip install tqdm
 ~~~
 
-`requirements.txt` reflects the broader research environment rather than a fully pinned CUDA/PyTorch lock. MOSEK is used by legacy modules under `eval/` and is not required by the core diffusion-hedging path.
+`requirements.txt` lists the direct dependencies of the retained source tree. It is not a fully pinned CUDA/PyTorch lock.
 
 ### Data-free verification
 
@@ -269,7 +269,7 @@ The driver writes a summary CSV and, when method output lengths agree, a compani
 
 ## Results and reproducibility boundaries
 
-`sanity_check.py` audits window counts, alignment, COVID coverage, and descriptive statistics. `build_CD.py`, `eval_hedging.py`, and `plot_hedging_figures.py` consume local result bundles to construct tables and figures.
+`sanity_check.py` audits window counts, alignment, COVID coverage, and descriptive statistics. `build_CD.py`, `summarize_hedging_results.py`, and `plot_hedging_figures.py` consume local result bundles to construct tables and figures.
 
 Result directories are excluded from Git. A publication artifact should archive the clean source commit, preprocessing and training metadata, base and folded fine-tuned checkpoints, raw backtest CSVs, sanity reports, and generated exhibits.
 

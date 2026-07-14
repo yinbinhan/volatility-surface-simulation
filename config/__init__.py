@@ -1,5 +1,5 @@
 """
-Configuration package for Diffusion Factor Model
+Configuration package for Adapted Sequential Diffusion
 """
 
 from config.config import * 

@@ -8,8 +8,8 @@ import torch
 from tqdm.auto import tqdm
 
 import config.config as config
-from diffusion_factor_model import ConditionalTransformer, SequentialGaussianDiffusion
-from diffusion_factor_model.fine_tuning import inject_lora
+from adapted_sequential_diffusion import ConditionalTransformer, SequentialGaussianDiffusion
+from adapted_sequential_diffusion.fine_tuning import inject_lora
 
 
 def infer_shape(data_path: str):

@@ -24,17 +24,15 @@ METHOD_COLS = {
     "unhedged": "Z_unhedged",
     "delta": "Z_delta",
     "delta_vega": "Z_delta_vega",
-    "volgan": "Z_volgan",
     "diffusion": "Z_diffusion",
 }
 # Methods shown in the comparison figures (paper compares the three hedges)
-FIG_METHODS = ["delta", "delta_vega", "volgan", "diffusion"]
-DATA_DRIVEN_METHODS = ["volgan", "diffusion"]
+FIG_METHODS = ["delta", "delta_vega", "diffusion"]
+DATA_DRIVEN_METHODS = ["diffusion"]
 FIG_LABELS = {
     "unhedged": "Unhedged",
     "delta": "Delta",
     "delta_vega": "Delta-vega",
-    "volgan": "VolGAN",
     "diffusion": "Diffusion",
 }
 
@@ -44,12 +42,10 @@ PAPER_REF = {
     "included": {
         "delta":      dict(std=32.70, var_5pct=19.49, var_2_5pct=36.33, var_1pct=58.63),
         "delta_vega": dict(std=29.70, var_5pct=10.90, var_2_5pct=19.70, var_1pct=43.72),
-        "volgan":     dict(std=32.98, var_5pct=12.79, var_2_5pct=23.42, var_1pct=50.79),
     },
     "excluded": {
         "delta":      dict(std=8.40,  var_5pct=13.22, var_2_5pct=22.84, var_1pct=36.66),
         "delta_vega": dict(std=9.34,  var_5pct=9.58,  var_2_5pct=16.67, var_1pct=34.81),
-        "volgan":     dict(std=8.15,  var_5pct=10.55, var_2_5pct=17.32, var_1pct=33.85),
     },
 }
 
@@ -216,7 +212,6 @@ def _timeseries(df: pd.DataFrame, figdir: Path, symlog: bool):
     colors = {
         "delta": "tab:blue",
         "delta_vega": "tab:orange",
-        "volgan": "tab:green",
         "diffusion": "tab:red",
     }
     for k, m0 in enumerate(m0_vals):

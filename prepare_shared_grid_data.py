@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare rolling diffusion windows from shared-grid VolGAN artifacts."""
+"""Prepare rolling diffusion windows from shared-grid surface artifacts."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import numpy as np
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--processed-dir", required=True, help="Directory produced by VolGAN shared_grid_preprocessing.py")
+    parser.add_argument("--processed-dir", required=True, help="Directory produced by shared_grid_preprocessing.py")
     parser.add_argument("--output-dir", default="data/shared_grid_11x9")
     parser.add_argument("--seq-len", type=int, default=30)
     parser.add_argument("--conditioning-length", type=int, default=29)
@@ -42,7 +42,7 @@ def load_shared_grid(processed_dir: Path) -> tuple[dict, np.lib.npyio.NpzFile]:
     grid = json.loads(grid_path.read_text())
     tensor = np.load(tensor_path)
     if grid.get("grid_order") != "m_major_tau_minor":
-        raise ValueError("expected VolGAN shared grid order m_major_tau_minor")
+        raise ValueError("expected shared grid order m_major_tau_minor")
     return grid, tensor
 
 

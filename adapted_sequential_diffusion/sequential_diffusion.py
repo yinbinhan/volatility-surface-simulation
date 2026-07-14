@@ -32,7 +32,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
 from accelerate import Accelerator
-from diffusion_factor_model.attend import Attend
+from adapted_sequential_diffusion.attend import Attend
 
 # constants
 

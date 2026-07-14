@@ -1,7 +1,7 @@
 """OptionMetrics delta-grid surface loader and Black-Scholes utilities.
 
 Provides realized P&L marking that is independent of the NW-smoothed training
-surface used by VolGAN.  The vsurfd files (vol_surface_delta_grid/) have one row
+surface used by the diffusion model.  The vsurfd files (vol_surface_delta_grid/) have one row
 per (date, days, delta, cp_flag) and cover all trading days without gaps.
 
 Interpolation is bilinear in (impl_moneyness = impl_strike/spot, days) space.

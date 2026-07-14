@@ -12,34 +12,37 @@ import pandas as pd
 import torch
 
 import config.config as config
-from diffusion_factor_model import ConditionalTransformer, SequentialGaussianDiffusion
-from backtest_volgan import (
-    RISK_FREE,
+from delta_surface import (
+    delta_vega_contracts as _ds_greeks,
+    load_delta_surface,
+    price_contracts as _ds_price,
+)
+from adapted_sequential_diffusion import ConditionalTransformer, SequentialGaussianDiffusion
+from hedging import (
+    BENCHMARK_VEGA_FLOOR,
+    build_instrument_panel,
+    select_alpha_aic,
+    solve_transaction_cost_lasso,
+)
+from hedging_backtest_utils import (
     assemble_total_greeks,
     assemble_total_scenarios,
     assemble_total_vector,
     bs_price_from_surface,
-    build_instrument_panel,
     build_state_lookup,
     get_day_state,
     get_half_spreads,
-    load_delta_surface,
-    print_table2,
+    intrinsic_values,
+    print_tracking_error_table,
     scenarios_to_solver_arrays,
-    select_alpha_aic,
-    solve_transaction_cost_lasso,
+    set_contract_tau,
     split_hedge_universe,
     tracking_error_stats,
-    _hedging,
-    _ds_greeks,
-    _ds_price,
-    _intrinsic,
-    _set_tau,
 )
-
-BENCHMARK_VEGA_FLOOR = _hedging.BENCHMARK_VEGA_FLOOR
-LAST_DROP = None  # diag: reason a window returned None
 from implied_rate import load_rate_table, rate_lookup
+
+RISK_FREE = 0.0
+LAST_DROP = None  # diag: reason a window returned None
 RATE_TABLE: dict = {}      # date -> PCP-implied rate; empty => RISK_FREE
 PHI_VEGA_CAP = 10.0        # delta_vega: freeze vega leg if |phi_vega| would exceed this
 
@@ -232,8 +235,8 @@ def run_one_window(
         LAST_DROP = 't0_state None'; return None
     log_iv_t0, spot_t0, *_ = t0_state
     tau_t0 = max((expiry - t0_date).days / 365, 1.0 / 365)
-    tc_t0 = _set_tau(target_contracts, tau_t0)
-    hc_t0 = _set_tau(hedge_contracts, tau_t0)
+    tc_t0 = set_contract_tau(target_contracts, tau_t0)
+    hc_t0 = set_contract_tau(hedge_contracts, tau_t0)
 
     t0_target_prices = bs_price_from_surface(log_iv_t0, spot_t0, tc_t0, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
     t0_hedge_prices_option = bs_price_from_surface(log_iv_t0, spot_t0, hc_t0, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
@@ -288,10 +291,10 @@ def run_one_window(
             _brk = f"delta None @step{step}"; break
         c_t = get_half_spreads(panel.quotes, date_t, hedge_ids, fallback=c_t0)
 
-        tc_ds_t = _set_tau(target_contracts, tau_t)
-        hc_ds_t = _set_tau(hedge_contracts, tau_t)
-        tc_ds_tp1 = _set_tau(target_contracts, tau_tp1)
-        hc_ds_tp1 = _set_tau(hedge_contracts, tau_tp1)
+        tc_ds_t = set_contract_tau(target_contracts, tau_t)
+        hc_ds_t = set_contract_tau(hedge_contracts, tau_t)
+        tc_ds_tp1 = set_contract_tau(target_contracts, tau_tp1)
+        hc_ds_tp1 = set_contract_tau(hedge_contracts, tau_tp1)
         prices_target_t = _ds_price(day_df_t, spot_t, tc_ds_t, r=r_win)
         prices_hedge_t_option = _ds_price(day_df_t, spot_t, hc_ds_t, r=r_win)
         prices_target_tp1 = _ds_price(day_df_tp1, spot_tp1, tc_ds_tp1, r=r_win)
@@ -299,8 +302,8 @@ def run_one_window(
         prices_hedge_t = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_t_option, underlying_idx, spot_t)
         prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
         if step == len(trading_dates) - 2:  # terminal day: exact intrinsic payoff settlement at S_T
-            prices_target_tp1 = _intrinsic(tc_ds_tp1, spot_tp1)
-            prices_hedge_tp1_option = _intrinsic(hc_ds_tp1, spot_tp1)
+            prices_target_tp1 = intrinsic_values(tc_ds_tp1, spot_tp1)
+            prices_hedge_tp1_option = intrinsic_values(hc_ds_tp1, spot_tp1)
             prices_hedge_tp1 = assemble_total_vector(len(sorted_hedges), option_indices, prices_hedge_tp1_option, underlying_idx, spot_tp1)
         V_tp1 = float(prices_target_tp1.sum())
         Z_unhedged.append(V_tp1 - V0_ds)
@@ -330,10 +333,10 @@ def run_one_window(
         Pi_dv = Pi_dv_new
         phi_vega_atm = phi_vega_new
 
-        tc_nw_t = _set_tau(target_contracts, tau_t)
-        hc_nw_t = _set_tau(hedge_contracts, tau_t)
-        tc_nw_next = _set_tau(target_contracts, tau_tp1)
-        hc_nw_next = _set_tau(hedge_contracts, tau_tp1)
+        tc_nw_t = set_contract_tau(target_contracts, tau_t)
+        hc_nw_t = set_contract_tau(hedge_contracts, tau_t)
+        tc_nw_next = set_contract_tau(target_contracts, tau_tp1)
+        hc_nw_next = set_contract_tau(hedge_contracts, tau_tp1)
         prices_target_t_nw = bs_price_from_surface(log_iv_t, spot_t, tc_nw_t, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
         prices_hedge_t_nw_option = bs_price_from_surface(log_iv_t, spot_t, hc_nw_t, r=r_win, m_grid=m_grid, tau_grid=tau_grid, grid_order=grid_order)
         scenarios_t = sample_diffusion_scenarios(ctx, date_t, spot_t, n_scenarios, batch_size)
@@ -449,7 +452,7 @@ def main() -> None:
     print(f"\nTotal windows: {n_windows}, total observations: {len(results_all['diffusion'])}")
     if not results_all["diffusion"]:
         return
-    print_table2(results_all)
+    print_tracking_error_table(results_all)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         rows = [{"method": method, **tracking_error_stats(Z)} for method, Z in results_all.items()]

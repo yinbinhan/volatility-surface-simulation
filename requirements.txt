@@ -8,29 +8,15 @@ accelerate>=0.20.0
 # Numerics
 numpy>=1.20.0
 scipy>=1.7.0
-numba
 packaging
 
-# Data / finance
+# Data
 pandas>=1.3.0
-pandas-datareader
-yfinance
-wrds
-
-# ML utilities
-scikit-learn>=1.0.0
 
 # Visualisation
 matplotlib>=3.5.0
-seaborn>=0.11.0
 Pillow
 
-# Logging
+# Training utilities and logging
+tqdm
 tensorboard
-wandb
-
-# Optimisation (license required)
-mosek>=10.0.0
-
-# Stats (VolGAN)
-statsmodels

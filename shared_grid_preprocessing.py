@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build shared 11x9 OptionMetrics surfaces for VolGAN-style experiments."""
+"""Build shared 11x9 OptionMetrics surfaces for diffusion experiments."""
 
 from __future__ import annotations
 
@@ -226,7 +226,7 @@ def write_outputs(output_dir: Path, spx_daily: pd.DataFrame, accepted_dates: lis
         "grid_order": GRID_ORDER,
         "source_data_dir": manifest["source_data_dir"],
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "later_shape_contract": {"surface_points": 99, "volgan_output_dim": 100, "volgan_condition_dim": 102},
+        "model_shape_contract": {"surface_points": 99, "surface_return_dim": 100, "conditioning_dim": 102},
     }
     (output_dir / "grid_config.json").write_text(json.dumps(grid_config, indent=2, sort_keys=True) + "\n")
     accepted_daily = spx_daily[spx_daily["date"].isin(accepted_dates)].copy()

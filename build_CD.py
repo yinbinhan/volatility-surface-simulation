@@ -1,7 +1,9 @@
-"""Build C+D exhibits from locked raw: T1,T3,T4,T6 tables + F3,F4,F5 figures + re-lock T2.
-LASSO methods = diffusion (base raw), VolGAN (volgan raw), diffusion-FT (ft raw).
-Tier-D cols (n_instruments, hedged_delta/vega, alpha) are per-method (each in its own raw);
-straddle_delta/vega, V_t are method-independent (use base)."""
+"""Build diffusion-hedging tables and figures from locked raw results.
+
+The reported LASSO methods are base diffusion and fine-tuned diffusion. Classical
+unhedged, delta, and delta-vega results are included in the pooled summary.
+Per-method diagnostic columns are read from each method's own raw output."""
+
 import numpy as np, pandas as pd
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -10,7 +12,7 @@ L=Path("results/locked_20260712"); F=Path("results/fixed_20260712")
 M0S=[0.75,0.8,0.9,1.1,1.2,1.25]
 CMAP={m:c for m,c in zip(M0S,["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b"])}
 # LASSO methods: label -> (raw tag, Z column)
-LASSO={"diffusion":("base","diffusion"),"VolGAN":("volgan","volgan"),"diffusion-FT":("ft","diffusion")}
+LASSO={"diffusion":("base","diffusion"),"diffusion-FT":("ft","diffusion")}
 def raw(tag,arm="in"): return pd.read_csv(L/f"merged_{tag}_{arm}_raw.csv",parse_dates=["window_start","rebalance_date"])
 
 # ---------- T1: freq of #instruments per m0, per method (COVID included / full) ----------
@@ -61,7 +63,7 @@ def poolstats(f,col):
 t2=[]
 for arm,cov in [("in","included"),("out","excluded")]:
     for col,lab,tag in [("unhedged","unhedged","base"),("delta","delta","base"),("delta_vega","delta_vega","base"),
-                        ("volgan","volgan","volgan"),("diffusion","diffusion","base"),("diffusion","diffusion_ft","ft")]:
+                        ("diffusion","diffusion","base"),("diffusion","diffusion_ft","ft")]:
         s=poolstats(L/f"merged_{tag}_{arm}_raw.csv",col); s.update(covid=cov,method=lab); t2.append(s)
 pd.DataFrame(t2).to_csv(L/"TABLE2_locked.csv",index=False)
 
@@ -99,7 +101,7 @@ fig.tight_layout(); fig.savefig(L/"F5_ninstruments_by_m0.png",dpi=140,bbox_inche
 
 print("BUILT T1,T3,T4,T6,TABLE2_locked + F3,F4,F5")
 # quick prints
-print("\n== T1 (diffusion vs VolGAN, m0=0.9 & 1.1) ==")
+print("\n== T1 (base vs fine-tuned diffusion, m0=0.9 & 1.1) ==")
 d1=pd.DataFrame(t1)
 print(d1[(d1.m0.isin([0.9,1.1]))][["method","m0",1,2,3,4,5,6,7,8]].to_string(index=False))
 print("\n== T6 % within 1% of V_t ==")

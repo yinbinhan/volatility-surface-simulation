@@ -15,12 +15,10 @@ METHOD_LABELS = {
     "unhedged": "Unhedged",
     "delta": "Delta",
     "delta_vega": "Delta-vega",
-    "volgan": "VolGAN",
     "diffusion": "Diffusion",
 }
 
 MODEL_LABELS = {
-    "volgan": "VolGAN",
     "diffusion": "Diffusion",
 }
 
@@ -112,17 +110,12 @@ def write_stats(frames: list[tuple[str, pd.DataFrame, str]], output_dir: Path) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--volgan-raw", type=Path, default=None)
     parser.add_argument("--diffusion-raw", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     frames: list[tuple[str, pd.DataFrame, str]] = []
-    if args.volgan_raw is not None and args.volgan_raw.exists():
-        volgan = load_raw(args.volgan_raw, "volgan")
-        plot_model(volgan, "volgan", args.output_dir)
-        frames.append(("volgan", volgan, "volgan"))
     if args.diffusion_raw is not None and args.diffusion_raw.exists():
         diffusion = load_raw(args.diffusion_raw, "diffusion")
         plot_model(diffusion, "diffusion", args.output_dir)

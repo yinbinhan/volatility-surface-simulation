@@ -1,76 +1,149 @@
-"""Sanity checks for the fixed-pipeline rerun. Writes SANITY_REPORT.txt."""
-import numpy as np, pandas as pd, glob, sys
+"""Sanity checks for the fixed diffusion-hedging pipeline rerun."""
+
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
 OUT = Path("results/fixed_20260712")
 OLD = Path("results/final_20260711")
-CRASH = ["2020-02","2020-03","2020-04"]
-META = {"observation","window_id","m0","window_start","rebalance_date","interval_end","row_in_window"}
-lines = []
-def p(s): lines.append(s); print(s)
+CRASH_MONTHS = ["2020-02", "2020-03", "2020-04"]
+TAGS = {
+    "base_in": "included",
+    "base_out": "excluded",
+    "ft_in": "included",
+    "ft_out": "excluded",
+}
 
-def load(f):
-    return pd.read_csv(f, parse_dates=["window_start"]) if Path(f).exists() else None
+lines: list[str] = []
 
-def stats(df, col):
-    Z = df[col].dropna().values
-    return (len(Z), np.std(Z), -np.percentile(Z,5), -np.percentile(Z,1)) if len(Z) else (0,0,0,0)
 
-tags = {"base_in":"included","base_out":"excluded","ft_in":"included","ft_out":"excluded",
-        "volgan_in":"included","volgan_out":"excluded"}
-p("="*70); p("SANITY REPORT — fixed pipeline (vega-freeze + terminal payoff)"); p("="*70)
+def report(message: str) -> None:
+    lines.append(message)
+    print(message)
 
-# 1. window counts + crash presence + fairness
-p("\n[1] WINDOW COUNTS (unique window_start) + crash-month presence")
-wsets={}
-for tag,cov in tags.items():
-    df=load(OUT/f"merged_{tag}_raw.csv")
-    if df is None: p(f"  {tag:<11} MISSING"); continue
-    u=sorted(df.window_start.dt.strftime("%Y-%m").unique()); wsets[tag]=set(df.window_start.dt.date.unique())
-    crash=[m for m in CRASH if any(x.startswith(m) for x in u)]
-    p(f"  {tag:<11} windows={df.window_start.nunique():>3}  obs={len(df):>5}  crash_present={crash}")
 
-# 2. fairness: same window set across methods within a covid arm
-p("\n[2] FAIRNESS (identical window set across methods per covid arm)")
-for cov,grp in [("included",["base_in","ft_in","volgan_in"]),("excluded",["base_out","ft_out","volgan_out"])]:
-    ss=[wsets[g] for g in grp if g in wsets]
-    if len(ss)==len(grp):
-        same=all(s==ss[0] for s in ss); p(f"  {cov}: identical={same} (sizes {[len(s) for s in ss]})")
+def load(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    return pd.read_csv(path, parse_dates=["window_start"])
 
-# 3. incl vs excl gap (the COVID spike)
-p("\n[3] COVID incl vs excl (std / VaR1%) — expect incl >> excl now")
-for meth,(ti,to) in {"diffusion":("base_in","base_out"),"volgan":("volgan_in","volgan_out"),
-                     "delta":("base_in","base_out"),"delta_vega":("base_in","base_out"),
-                     "diffusion_ft":("ft_in","ft_out")}.items():
-    col="diffusion" if meth=="diffusion_ft" else meth
-    di,do=load(OUT/f"merged_{ti}_raw.csv"),load(OUT/f"merged_{to}_raw.csv")
-    if di is None or do is None or col not in di.columns: continue
-    ni,si,_,vi=stats(di,col); no,so,_,vo=stats(do,col)
-    p(f"  {meth:<13} incl std={si:6.2f} V1%={vi:7.2f} | excl std={so:6.2f} V1%={vo:7.2f} | ratio std={si/so if so else 0:.2f}")
 
-# 4. old vs new diff
-p("\n[4] OLD (broken, results/final_20260711) vs NEW (fixed) — diffusion/volgan")
-oldmap={"included":("merged_base_covid_in_raw.csv","merged_volgan_covid_in_raw.csv"),
-        "excluded":(None,None)}  # old excl was reused rqtau; compare incl only + note
-for cov,(ob,ov) in oldmap.items():
-    if ob is None: continue
-    for col,of in [("diffusion",ob),("volgan",ov)]:
-        oldf=OLD/of; newtag={"diffusion":"base_"+("in" if cov=="included" else "out"),
-                             "volgan":"volgan_"+("in" if cov=="included" else "out")}[col]
-        newf=OUT/f"merged_{newtag}_raw.csv"
-        if oldf.exists() and newf.exists():
-            _,os_,_,ov1=stats(load(oldf),col); _,ns_,_,nv1=stats(load(newf),col)
-            p(f"  {cov} {col:<10} OLD std={os_:6.2f} V1={ov1:7.2f} -> NEW std={ns_:6.2f} V1={nv1:7.2f}")
+def stats(
+    frame: pd.DataFrame, column: str
+) -> tuple[int, float, float, float]:
+    values = frame[column].dropna().to_numpy(dtype=float)
+    if not len(values):
+        return 0, 0.0, 0.0, 0.0
+    return (
+        len(values),
+        float(np.std(values)),
+        float(-np.percentile(values, 5)),
+        float(-np.percentile(values, 1)),
+    )
 
-# 5. verdict heuristics
-p("\n[5] HEURISTIC FLAGS (for confidence judgment)")
-flags=[]
-for tag in ["base_in","volgan_in"]:
-    df=load(OUT/f"merged_{tag}_raw.csv")
-    if df is not None and df.window_start.nunique() < 48: flags.append(f"{tag} only {df.window_start.nunique()} windows (<48)")
-bi,bo=load(OUT/"merged_base_in_raw.csv"),load(OUT/"merged_base_out_raw.csv")
-if bi is not None and bo is not None:
-    _,si,_,_=stats(bi,"delta"); _,so,_,_=stats(bo,"delta")
-    if si/so < 1.3: flags.append(f"delta incl/excl std ratio {si/so:.2f} (<1.3 -> COVID spike still weak)")
-p("  FLAGS: "+("; ".join(flags) if flags else "none — looks healthy"))
-open(OUT/"SANITY_REPORT.txt","w").write("\n".join(lines)+"\n")
-print("\nwrote", OUT/"SANITY_REPORT.txt")
+
+report("=" * 70)
+report("SANITY REPORT — fixed diffusion-hedging pipeline")
+report("=" * 70)
+
+report("\n[1] WINDOW COUNTS AND CRASH-MONTH COVERAGE")
+window_sets: dict[str, set] = {}
+for tag, coverage in TAGS.items():
+    frame = load(OUT / f"merged_{tag}_raw.csv")
+    if frame is None:
+        report(f"  {tag:<11} MISSING")
+        continue
+    months = sorted(frame.window_start.dt.strftime("%Y-%m").unique())
+    window_sets[tag] = set(frame.window_start.dt.date.unique())
+    present = [
+        month
+        for month in CRASH_MONTHS
+        if any(value.startswith(month) for value in months)
+    ]
+    report(
+        f"  {tag:<11} coverage={coverage:<8} "
+        f"windows={frame.window_start.nunique():>3} "
+        f"obs={len(frame):>5} crash_present={present}"
+    )
+
+report("\n[2] BASE/FINE-TUNED WINDOW-SET ALIGNMENT")
+for coverage, group in [
+    ("included", ["base_in", "ft_in"]),
+    ("excluded", ["base_out", "ft_out"]),
+]:
+    available = [window_sets[tag] for tag in group if tag in window_sets]
+    if len(available) == len(group):
+        identical = all(values == available[0] for values in available)
+        report(
+            f"  {coverage}: identical={identical} "
+            f"(sizes {[len(values) for values in available]})"
+        )
+
+report("\n[3] COVID-INCLUDED VS COVID-EXCLUDED DESCRIPTIVE STATISTICS")
+comparisons = {
+    "diffusion": ("base_in", "base_out", "diffusion"),
+    "diffusion_ft": ("ft_in", "ft_out", "diffusion"),
+    "delta": ("base_in", "base_out", "delta"),
+    "delta_vega": ("base_in", "base_out", "delta_vega"),
+}
+for method, (included_tag, excluded_tag, column) in comparisons.items():
+    included = load(OUT / f"merged_{included_tag}_raw.csv")
+    excluded = load(OUT / f"merged_{excluded_tag}_raw.csv")
+    if (
+        included is None
+        or excluded is None
+        or column not in included.columns
+        or column not in excluded.columns
+    ):
+        continue
+    _, std_in, _, var1_in = stats(included, column)
+    _, std_out, _, var1_out = stats(excluded, column)
+    ratio = std_in / std_out if std_out else 0.0
+    report(
+        f"  {method:<13} incl std={std_in:6.2f} V1%={var1_in:7.2f} "
+        f"| excl std={std_out:6.2f} V1%={var1_out:7.2f} "
+        f"| ratio std={ratio:.2f}"
+    )
+
+report("\n[4] PRIOR VS FIXED BASE-DIFFUSION RUN")
+old_path = OLD / "merged_base_covid_in_raw.csv"
+new_path = OUT / "merged_base_in_raw.csv"
+if old_path.exists() and new_path.exists():
+    old_frame = load(old_path)
+    new_frame = load(new_path)
+    if old_frame is not None and new_frame is not None:
+        _, old_std, _, old_var1 = stats(old_frame, "diffusion")
+        _, new_std, _, new_var1 = stats(new_frame, "diffusion")
+        report(
+            f"  included diffusion OLD std={old_std:6.2f} "
+            f"V1={old_var1:7.2f} -> NEW std={new_std:6.2f} "
+            f"V1={new_var1:7.2f}"
+        )
+
+report("\n[5] HEURISTIC FLAGS")
+flags: list[str] = []
+for tag in ["base_in", "ft_in"]:
+    frame = load(OUT / f"merged_{tag}_raw.csv")
+    if frame is not None and frame.window_start.nunique() < 48:
+        flags.append(
+            f"{tag} only {frame.window_start.nunique()} windows (<48)"
+        )
+
+base_in = load(OUT / "merged_base_in_raw.csv")
+base_out = load(OUT / "merged_base_out_raw.csv")
+if base_in is not None and base_out is not None:
+    _, std_in, _, _ = stats(base_in, "delta")
+    _, std_out, _, _ = stats(base_out, "delta")
+    ratio = std_in / std_out if std_out else 0.0
+    if ratio < 1.3:
+        flags.append(
+            f"delta incl/excl std ratio {ratio:.2f} "
+            "(<1.3; inspect COVID coverage)"
+        )
+
+report("  FLAGS: " + ("; ".join(flags) if flags else "none"))
+report_path = OUT / "SANITY_REPORT.txt"
+report_path.write_text("\n".join(lines) + "\n")
+print("\nwrote", report_path)

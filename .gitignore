@@ -173,32 +173,27 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .jupyter_ystore.db
-<<<<<<< HEAD
 
-/samples
-/model_results
-/data
-/figs
-=======
-model_results/
-samples/
-Evalution_factor.ipynb
-config/config.py
-model_results/
-samples/
-
-*.npy
-/data
-/figs
-/sp500_exp_code
-
-DiT.py
-
-/eval
-
+# macOS
 .DS_Store
-results_rqtau/
 
-# agent context routers — local only, never push
+# Project data, checkpoints, samples, and generated outputs
+/data/
+/model_results/
+/samples/
+/empirical_analysis_data/
+/simulation_experiment_data/
+/eval/vol_simulation/
+/results/
+/results_rqtau/
+/figs/
+/logs/
+/overnight/
+*.pt
+*.pth
+*.ckpt
+
+# Local coordination and agent context
 AGENTS.md
 CLAUDE.md
+PR_BODY.md

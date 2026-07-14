@@ -32,5 +32,5 @@ wandb
 # Optimisation (license required)
 mosek>=10.0.0
 
-# Stats (VolGAN)
+# Statistical utilities
 statsmodels

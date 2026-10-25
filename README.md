@@ -1,5 +1,7 @@
 # Diffusion-Generated Volatility Surfaces for Option Hedging
 
+Official implementation of the paper: [Diffusion Models for Dynamic Volatility Surface Generation and Data-Driven Hedging](https://arxiv.org/abs/2609.13402)
+
 Research code for conditional simulation of daily SPX implied-volatility surfaces and their use in sparse, transaction-cost-aware option hedging.
 
 The pipeline:
@@ -291,3 +293,16 @@ When citing this software, record the exact repository commit together with the 
 ## License
 
 The repository is released under the [MIT License](LICENSE). The license applies to this repository's code, not to licensed OptionMetrics data.
+
+## Citation
+
+If you find this code useful, please cite:
+
+```bibtex
+@inproceedings{han2026diffusion,
+  title={Diffusion Models for Dynamic Volatility Surface Generation and Data-Driven Hedging},
+  author={Han, Yinbin and Zhang, Jack Yuxiang and Torres, Manuel and Acero, Fernando and Xu, Renyuan},
+  booktitle={ACM International Conference on AI in Finance (ICAIF)},
+  year={2026}
+}
+```
